@@ -1,0 +1,3009 @@
+rom ...excepts import BadClient, GRPCServerError
+from ...logging.base import get_logger
+from ...proto import jina_pb2_grpc
+
+if False:
+    # fix type-hint complain for sphinx and flake
+    import argparse
+
+
+class GrpcClient:
+    """
+    A Base gRPC client which the other python client application can build from.
+
+    """
+
+    def __init__(self, args: 'argparse.Namespace'):
+        self.args = args
+        if not args.proxy and os.name != 'nt':
+            os.unsetenv('http_proxy')
+            os.unsetenv('https_proxy')
+        self.logger = get_logger(self.__class__.__name__, **vars(args))
+        self.logger.debug('setting up grpc insecure channel...')
+        # A gRPC channel provides a connection to a remote gRPC server.
+        self._channel = grpc.insecure_channel(
+            '%s:%d' % (args.host, args.port_grpc),
+            options={
+                'grpc.max_send_message_length': -1,
+                'grpc.max_receive_message_length': -1,
+            }.items(),
+        )
+        self.logger.debug('waiting channel to be ready...')
+        try:
+            grpc.channel_ready_future(self._channel).result(timeout=args.timeout_ready / 1000)
+        except grpc.FutureTimeoutError:
+            self.logger.critical('can not connect to the server at %s:%d after %d ms, please double check the '
+                                 'ip and grpc port number of the server'
+                                 % (args.host, args.port_grpc, args.timeout_ready))
+            raise GRPCServerError('can not connect to the server at %s:%d' % (args.host, args.port_grpc))
+
+            # create new stub
+        self.logger.debug('create new stub...')
+        self._stub = jina_pb2_grpc.JinaRPCStub(self._channel)
+
+        # attache response handler
+        self.logger.success('connected to the gateway at %s:%d!' % (self.args.host, self.args.port_grpc))
+        self.is_closed = False
+
+    def call(self, *args, **kwargs):
+        """Calling the grpc server """
+        raise NotImplementedError
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def start(self, *args, **kwargs):
+        """Wrapping :meth:`call` and provide exception captures
+        """
+
+        try:
+            self.call(*args, **kwargs)
+        except KeyboardInterrupt:
+            self.logger.warning('user cancel the process')
+        except grpc.RpcError as rpc_error_call:  # Since this object is guaranteed to be a grpc.Call, might as well include that in its name.
+            my_code = rpc_error_call.code()
+            my_details = rpc_error_call.details()
+            if my_code == grpc.StatusCode.UNAVAILABLE:
+                self.logger.error('the ongoing request is terminated as the server is not available or closed already')
+            elif my_code == grpc.StatusCode.INTERNAL:
+                self.logger.error('internal error on the server side')
+            else:
+                raise BadClient('%s error in grpc: %s '
+                                'often the case is that you define/send a bad input iterator to jina, '
+                                'please double check your input iterator' % (my_code, my_details))
+        finally:
+            self.close()
+
+        return self
+
+    def close(self):
+        """Gracefully shutdown the client and release all grpc-related resources """
+        if not self.is_closed:
+            self._channel.close()
+            self.logger.success(__stop_msg__)
+            self.is_closed = True
+__copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
+__license__ = "Apache-2.0"
+
+import sys
+import time
+
+from ...helper import colored
+from ...logging import profile_logger
+
+
+class ProgressBar:
+    """A simple progress bar
+
+    Example:
+
+        .. highlight:: python
+        .. code-block:: python
+
+            with ProgressBar('loop'):
+                do_busy()
+    """
+
+    def __init__(self, bar_len: int = 20, task_name: str = '', logger=None):
+        """
+
+        :param bar_len: total length of the bar
+        :param task_name: the name of the task, will be displayed in front of the bar
+        """
+        self.bar_len = bar_len
+        self.task_name = task_name
+        self.num_docs = 0
+        self.logger = logger
+
+    def update(self, progress: int = None, *args, **kwargs) -> None:
+        """ Increment the progress bar by one unit
+
+        :param progress: the number of unit to increment
+        """
+        self.num_reqs += 1
+        sys.stdout.write('\r')
+        elapsed = time.perf_counter() - self.start_time
+        num_bars = self.num_reqs % self.bar_len
+        num_bars = self.bar_len if not num_bars and self.num_reqs else max(num_bars, 1)
+        if progress:
+            self.num_docs += progress
+
+        sys.stdout.write(
+            '{:>10} [{:<{}}] 📃 {:6d} ⏱️ {:3.1f}s 🐎 {:3.1f}/s {:6d} batch'.format(
+                colored(self.task_name, 'cyan'),
+                colored('=' * num_bars, 'green'),
+                self.bar_len + 9,
+                self.num_docs,
+                elapsed,
+                self.num_docs / elapsed,
+                self.num_reqs
+            ))
+        if num_bars == self.bar_len:
+            sys.stdout.write('\n')
+        sys.stdout.flush()
+        profile_logger.debug({'num_bars': num_bars,
+                              'num_reqs': self.num_reqs,
+                              'bar_len': self.bar_len,
+                              'progress': num_bars / self.bar_len,
+                              'task_name': self.task_name,
+                              'qps': self.num_reqs / elapsed,
+                              'speed': (self.num_docs if self.num_docs > 0 else self.num_reqs) / elapsed,
+                              'speed_unit': ('Documents' if self.num_docs > 0 else 'Requests'),
+                              'elapsed': elapsed})
+
+    def __enter__(self):
+        self.start_time = time.perf_counter()
+        self.num_reqs = -1
+        self.num_docs = 0
+        self.update()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        elapsed = time.perf_counter() - self.start_time
+        if self.num_docs > 0:
+            speed = self.num_docs / elapsed
+        else:
+            speed = self.num_reqs / elapsed
+        sys.stdout.write('\t%s\n' % colored(f'✅ done in ⏱ {elapsed:3.1f}s 🐎 {speed:3.1f}/s', 'green'))
+__copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
+__license__ = "Apache-2.0"
+
+from typing import Iterator, Callable, Union
+
+from . import request
+from .grpc import GrpcClient
+from .helper import ProgressBar
+from ...enums import ClientInputType, ClientMode
+from ...excepts import BadClient
+from ...logging import default_logger
+from ...logging.profile import TimeContext
+from ...proto import jina_pb2
+
+if False:
+    # fix type-hint complain for sphinx and flake
+    import argparse
+
+
+class PyClient(GrpcClient):
+    """A simple Python client for connecting to the gateway. This class is for internal only,
+    use the python interface :func:`jina.clients.py_client` to start :class:`PyClient` if you
+    want to use it in Python.
+
+    Assuming a Flow is "standby" on 192.168.1.100, with port_grpc at 55555.
+
+    .. highlight:: python
+    .. code-block:: python
+
+        from jina.clients import py_client
+
+        # to test connectivity
+        py_client(port_grpc='192.168.1.100', host=55555).dry_run()
+
+        # to search
+        py_client(port_grpc='192.168.1.100', host=55555).search(input_fn, output_fn)
+
+        # to index
+        py_client(port_grpc='192.168.1.100', host=55555).index(input_fn, output_fn)
+
+    """
+
+    def __init__(self, args: 'argparse.Namespace'):
+        """
+
+        :param args: args provided by the CLI
+        :param delay: if ``True`` then the client starts sending request after initializing, otherwise one needs to set
+            the :attr:`input_fn` before using :func:`start` or :func:`call`
+        """
+        super().__init__(args)
+        self._mode = self.args.mode
+        self._input_fn = None
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    @mode.setter
+    def mode(self, value: ClientMode):
+        if isinstance(value, ClientMode):
+            self._mode = value
+            self.args.mode = value
+        else:
+            raise ValueError(f'{value} must be one of {ClientMode}')
+
+    @staticmethod
+    def check_input(input_fn: Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable] = None,
+                    input_type: ClientInputType = ClientInputType.BUFFER):
+        """Validate the input_fn and print the first request if success
+
+        :param input_fn: the input function
+        :param input_type: if the input data is in protobuf Document format, or in raw bytes, or data uri
+        """
+        kwargs = {'data': input_fn, 'input_type': input_type}
+
+        try:
+            r = next(getattr(request, 'index')(**kwargs))
+            if r is not None:
+                default_logger.success(f'input_fn is valid and the first request is as follows:\n{r}')
+            else:
+                raise TypeError
+        except:
+            default_logger.error(f'input_fn is not valid!')
+            raise
+
+    def call_unary(self, data: Union['jina_pb2.Document', bytes], mode: ClientMode) -> None:
+        """ Calling the server with one request only, and return the result
+
+        This function should not be used in production due to its low-efficiency. For example,
+        you should not use it in a for-loop. Use :meth:`call` instead.
+        Nonetheless, you can use it for testing one query and check the result.
+
+        :param data: the binary data of the document or the ``Document`` in protobuf
+        :param mode: request will be sent in this mode, available ``train``, ``index``, ``query``
+        """
+        self.mode = mode
+        kwargs = vars(self.args)
+        kwargs['data'] = [data]
+
+        req_iter = getattr(request, str(self.mode).lower())(**kwargs)
+        return self._stub.CallUnary(next(req_iter))
+
+    def call(self, callback: Callable[['jina_pb2.Message'], None] = None, **kwargs) -> None:
+        """ Calling the server, better use :func:`start` instead.
+
+        :param callback: a callback function, invoke after every response is received
+        """
+        # take the default args from client
+        _kwargs = vars(self.args)
+        _kwargs['data'] = self.input_fn
+        # override by the caller-specific kwargs
+        for k in _kwargs.keys():
+            if k in kwargs:
+                _kwargs[k] = kwargs[k]
+
+        tname = str(self.mode).lower()
+        if 'mode' in kwargs:
+            tname = str(kwargs['mode']).lower()
+
+        if 'mime_type' not in kwargs:
+            self.logger.warning('starting from v0.2.0, '
+                                'the best practice of sending binary data is with "mime_type". '
+                                'when not given then MIME sniff (based on libmagic) will be used')
+
+        req_iter = getattr(request, tname)(**_kwargs)
+        # next(req_iter)
+
+        with ProgressBar(task_name=tname) as p_bar, TimeContext(tname):
+            for resp in self._stub.Call(req_iter):
+                if callback:
+                    try:
+                        if self.args.callback_on_body:
+                            resp = getattr(resp, resp.WhichOneof('body'))
+                        callback(resp)
+                    except Exception as ex:
+                        raise BadClient('error in client\'s callback: %s' % ex)
+                p_bar.update(self.args.batch_size)
+
+    @property
+    def input_fn(self) -> Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable]:
+        """ An iterator of bytes, each element represents a document's raw content,
+        i.e. ``input_fn`` defined int the protobuf
+        """
+        if self._input_fn:
+            return self._input_fn
+        else:
+            raise BadClient('input_fn is empty or not set')
+
+    @input_fn.setter
+    def input_fn(self, bytes_gen: Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable]):
+        if self._input_fn:
+            self.logger.warning('input_fn is not empty, overrided')
+        if hasattr(bytes_gen, '__call__'):
+            self._input_fn = bytes_gen()
+        else:
+            self._input_fn = bytes_gen
+
+    def dry_run(self) -> bool:
+        """Send a DRYRUN request to the server, passing through all pods on the server
+        useful for testing connectivity and debugging
+
+        :return: if dry run is successful or not
+        """
+
+        def req_gen():
+            req = jina_pb2.Request()
+            req.control.command = jina_pb2.Request.ControlRequest.DRYRUN
+            yield req
+
+        for resp in self._stub.Call(req_gen()):
+            self.logger.info(resp)
+            return True
+
+        return False
+
+    def train(self, input_fn: Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable] = None,
+              output_fn: Callable[['jina_pb2.Message'], None] = None, **kwargs):
+        self.mode = ClientMode.TRAIN
+        self.input_fn = input_fn
+        self.start(output_fn, **kwargs)
+
+    def search(self, input_fn: Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable] = None,
+               output_fn: Callable[['jina_pb2.Message'], None] = None, **kwargs):
+        self.mode = ClientMode.SEARCH
+        self.input_fn = input_fn
+        self.start(output_fn, **kwargs)
+
+    def index(self, input_fn: Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable] = None,
+              output_fn: Callable[['jina_pb2.Message'], None] = None, **kwargs):
+        self.mode = ClientMode.INDEX
+        self.input_fn = input_fn
+        self.start(output_fn, **kwargs)
+import os
+
+import numpy as np
+
+from jina.drivers.helper import array2pb, pb2array
+from jina.enums import ClientInputType
+from jina.flow import Flow
+from jina.proto import jina_pb2
+from tests import JinaTestCase
+
+replicas = 10
+
+num_docs = 100
+chunks_per_doc = 100
+embed_dim = 1000
+
+
+def random_docs():
+    c_id = 0
+    np.random.seed(531)
+    for j in range(num_docs):
+        d = jina_pb2.Document()
+        for k in range(chunks_per_doc):
+            c = d.chunks.add()
+            # force sending at non-quantization
+            c.embedding.CopyFrom(array2pb(np.random.random([embed_dim]), quantize=None))
+            c.chunk_id = c_id
+            c.doc_id = j
+            c_id += 1
+        yield d
+
+
+def get_output(req):
+    np.random.seed(531)
+
+    err = 0
+    for d in req.docs:
+        for c in d.chunks:
+            recv = pb2array(c.embedding)
+            send = np.random.random([embed_dim])
+            err += np.sum(np.abs(recv - send)) / embed_dim
+
+    print(f'reconstruction error: {err / num_docs:.6f}')
+
+
+class MyTestCase(JinaTestCase):
+
+    def f1(self, quant):
+        os.environ['JINA_ARRAY_QUANT'] = quant
+
+        f = Flow(callback_on_body=True).add(yaml_path='_forward').add(yaml_path='_forward').add(
+            yaml_path='_forward').add(
+            yaml_path='_forward').add(yaml_path='_forward').add(yaml_path='_forward').add(yaml_path='_forward')
+        with f as fl:
+            fl.index(random_docs, output_fn=get_output, input_type=ClientInputType.PROTOBUF)
+
+    def f2(self, quant):
+        os.environ['JINA_ARRAY_QUANT'] = quant
+
+        f = Flow(callback_on_body=True, compress_hwm=1024).add(yaml_path='_forward').add(yaml_path='_forward').add(
+            yaml_path='_forward').add(
+            yaml_path='_forward').add(yaml_path='_forward').add(yaml_path='_forward').add(yaml_path='_forward')
+        with f as fl:
+            fl.index(random_docs, output_fn=get_output, input_type=ClientInputType.PROTOBUF)
+
+    def test_quant(self):
+        for j in ('fp32', 'fp16', 'uint8'):
+            self.f1(j)
+            self.f2(j)
+import unittest
+
+from jina.main.parser import set_pea_parser, set_pod_parser, set_gateway_parser
+from jina.peapods.gateway import GatewayPea
+from jina.peapods.pea import BasePea
+from jina.peapods.pod import BasePod, GatewayPod, MutablePod, GatewayFlowPod, FlowPod
+from tests import JinaTestCase
+
+
+class MyTestCase(JinaTestCase):
+
+    def test_pea_context(self):
+        def _test_pea_context(runtime):
+            args = set_pea_parser().parse_args(['--runtime', runtime])
+            with BasePea(args):
+                pass
+
+            BasePea(args).start().close()
+
+        for j in ('process', 'thread'):
+            with self.subTest(runtime=j):
+                _test_pea_context(j)
+
+    def test_address_in_use(self):
+        args1 = set_pea_parser().parse_args(['--port-ctrl', '55555'])
+        args2 = set_pea_parser().parse_args(['--port-ctrl', '55555'])
+        with BasePea(args1), BasePea(args2):
+            pass
+
+        args1 = set_pea_parser().parse_args(['--port-ctrl', '55555', '--runtime', 'thread'])
+        args2 = set_pea_parser().parse_args(['--port-ctrl', '55555', '--runtime', 'thread'])
+        with BasePea(args1), BasePea(args2):
+            pass
+
+        print('everything should quit gracefully')
+
+    def test_pod_context(self):
+        def _test_pod_context(runtime):
+            args = set_pod_parser().parse_args(['--runtime', runtime, '--replicas', '2'])
+            with BasePod(args):
+                pass
+
+            BasePod(args).start().close()
+
+        for j in ('process', 'thread'):
+            with self.subTest(runtime=j):
+                _test_pod_context(j)
+
+    def test_gateway_pea(self):
+        def _test_gateway_pea(runtime):
+            args = set_gateway_parser().parse_args(['--runtime', runtime])
+            with GatewayPea(args):
+                pass
+
+            GatewayPea(args).start().close()
+
+        for j in ('process', 'thread'):
+            with self.subTest(runtime=j):
+                _test_gateway_pea(j)
+
+    def test_gateway_pod(self):
+        def _test_gateway_pod(runtime):
+            args = set_gateway_parser().parse_args(['--runtime', runtime])
+            with GatewayPod(args):
+                pass
+
+            GatewayPod(args).start().close()
+
+        for j in ('process', 'thread'):
+            with self.subTest(runtime=j):
+                _test_gateway_pod(j)
+
+    def test_gatewayflow_pod(self):
+        def _test_gateway_pod(runtime):
+            with GatewayFlowPod({'runtime': runtime}):
+                pass
+
+            GatewayFlowPod({'runtime': runtime}).start().close()
+
+        for j in ('process', 'thread'):
+            with self.subTest(runtime=j):
+                _test_gateway_pod(j)
+
+    def test_mutable_pod(self):
+        def _test_mutable_pod(runtime):
+            args = set_pod_parser().parse_args(['--runtime', runtime, '--replicas', '2'])
+
+            with MutablePod(BasePod(args).peas_args):
+                pass
+
+            MutablePod(BasePod(args).peas_args).start().close()
+
+        for j in ('process', 'thread'):
+            with self.subTest(runtime=j):
+                _test_mutable_pod(j)
+
+    def test_flow_pod(self):
+        def _test_flow_pod(runtime):
+            args = {'runtime': runtime, 'replicas': 2}
+            with FlowPod(args):
+                pass
+
+            FlowPod(args).start().close()
+
+        for j in ('process', 'thread'):
+            with self.subTest(runtime=j):
+                _test_flow_pod(j)
+
+    def test_pod_context_autoshutdown(self):
+        def _test_pod_context(runtime):
+            args = set_pod_parser().parse_args(['--runtime', runtime,
+                                                '--replicas', '2',
+                                                '--max-idle-time', '5',
+                                                '--shutdown-idle'])
+            with BasePod(args) as bp:
+                bp.join()
+
+            BasePod(args).start().close()
+
+        for j in ('process', 'thread'):
+            with self.subTest(runtime=j):
+                _test_pod_context(j)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import time
+
+import requests
+
+from jina.clients import py_client
+from jina.clients.python import PyClient
+from jina.enums import ClientInputType, ClientMode
+from jina.flow import Flow
+from jina.main.parser import set_gateway_parser
+from jina.peapods.gateway import RESTGatewayPea
+from jina.proto.jina_pb2 import Document
+from tests import JinaTestCase
+
+
+class MyTestCase(JinaTestCase):
+
+    def test_client(self):
+        f = Flow().add(yaml_path='_forward')
+        with f:
+            print(py_client(port_grpc=f.port_grpc).call_unary(b'a1234', mode=ClientMode.INDEX))
+
+    def tearDown(self) -> None:
+        super().tearDown()
+        time.sleep(3)
+
+    def test_check_input(self):
+        input_fn = iter([b'1234', b'45467'])
+        PyClient.check_input(input_fn)
+        input_fn = iter([Document(), Document()])
+        PyClient.check_input(input_fn, input_type=ClientInputType.PROTOBUF)
+        # bad_input_fn = iter([b'1234', '45467'])  this is invalid as we convert str to binary
+        # self.assertRaises(TypeError, PyClient.check_input, bad_input_fn)
+        bad_input_fn = iter([Document()])
+        self.assertRaises(TypeError, PyClient.check_input, bad_input_fn)
+
+    def test_gateway_ready(self):
+        p = set_gateway_parser().parse_args([])
+        with RESTGatewayPea(p):
+            a = requests.get(f'http://0.0.0.0:{p.port_grpc}/ready')
+            self.assertEqual(a.status_code, 200)
+
+        with RESTGatewayPea(p):
+            a = requests.post(f'http://0.0.0.0:{p.port_grpc}/api/ass')
+            self.assertEqual(a.status_code, 405)
+
+    def test_gateway_index(self):
+        f = Flow(rest_api=True).add(yaml_path='_forward')
+        with f:
+            a = requests.post(f'http://0.0.0.0:{f.port_grpc}/api/index',
+                              json={'data': [
+                                  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAA2ElEQVR4nADIADf/AxWcWRUeCEeBO68T3u1qLWarHqMaxDnxhAEaLh0Ssu6ZGfnKcjP4CeDLoJok3o4aOPYAJocsjktZfo4Z7Q/WR1UTgppAAdguAhR+AUm9AnqRH2jgdBZ0R+kKxAFoAME32BL7fwQbcLzhw+dXMmY9BS9K8EarXyWLH8VYK1MACkxlLTY4Eh69XfjpROqjE7P0AeBx6DGmA8/lRRlTCmPkL196pC0aWBkVs2wyjqb/LABVYL8Xgeomjl3VtEMxAeaUrGvnIawVh/oBAAD///GwU6v3yCoVAAAAAElFTkSuQmCC',
+                                  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAA2ElEQVR4nADIADf/AvdGjTZeOlQq07xSYPgJjlWRwfWEBx2+CgAVrPrP+O5ghhOa+a0cocoWnaMJFAsBuCQCgiJOKDBcIQTiLieOrPD/cp/6iZ/Iu4HqAh5dGzggIQVJI3WqTxwVTDjs5XJOy38AlgHoaKgY+xJEXeFTyR7FOfF7JNWjs3b8evQE6B2dTDvQZx3n3Rz6rgOtVlaZRLvR9geCAxuY3G+0mepEAhrTISES3bwPWYYi48OUrQOc//IaJeij9xZGGmDIG9kc73fNI7eA8VMBAAD//0SxXMMT90UdAAAAAElFTkSuQmCC']})
+
+            j = a.json()
+            self.assertTrue('index' in j)
+            self.assertEqual(len(j['index']['docs']), 2)
+            self.assertEqual(j['index']['docs'][0]['dataUri'],
+                             'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAA2ElEQVR4nADIADf/AxWcWRUeCEeBO68T3u1qLWarHqMaxDnxhAEaLh0Ssu6ZGfnKcjP4CeDLoJok3o4aOPYAJocsjktZfo4Z7Q/WR1UTgppAAdguAhR+AUm9AnqRH2jgdBZ0R+kKxAFoAME32BL7fwQbcLzhw+dXMmY9BS9K8EarXyWLH8VYK1MACkxlLTY4Eh69XfjpROqjE7P0AeBx6DGmA8/lRRlTCmPkL196pC0aWBkVs2wyjqb/LABVYL8Xgeomjl3VtEMxAeaUrGvnIawVh/oBAAD///GwU6v3yCoVAAAAAElFTkSuQmCC')
+            self.assertEqual(a.status_code, 200)
+
+    def test_gateway_index_with_args(self):
+        f = Flow(rest_api=True).add(yaml_path='_forward')
+        with f:
+            a = requests.post(f'http://0.0.0.0:{f.port_grpc}/api/index',
+                              json={'data': [
+                                  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAA2ElEQVR4nADIADf/AxWcWRUeCEeBO68T3u1qLWarHqMaxDnxhAEaLh0Ssu6ZGfnKcjP4CeDLoJok3o4aOPYAJocsjktZfo4Z7Q/WR1UTgppAAdguAhR+AUm9AnqRH2jgdBZ0R+kKxAFoAME32BL7fwQbcLzhw+dXMmY9BS9K8EarXyWLH8VYK1MACkxlLTY4Eh69XfjpROqjE7P0AeBx6DGmA8/lRRlTCmPkL196pC0aWBkVs2wyjqb/LABVYL8Xgeomjl3VtEMxAeaUrGvnIawVh/oBAAD///GwU6v3yCoVAAAAAElFTkSuQmCC',
+                                  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAA2ElEQVR4nADIADf/AvdGjTZeOlQq07xSYPgJjlWRwfWEBx2+CgAVrPrP+O5ghhOa+a0cocoWnaMJFAsBuCQCgiJOKDBcIQTiLieOrPD/cp/6iZ/Iu4HqAh5dGzggIQVJI3WqTxwVTDjs5XJOy38AlgHoaKgY+xJEXeFTyR7FOfF7JNWjs3b8evQE6B2dTDvQZx3n3Rz6rgOtVlaZRLvR9geCAxuY3G+0mepEAhrTISES3bwPWYYi48OUrQOc//IaJeij9xZGGmDIG9kc73fNI7eA8VMBAAD//0SxXMMT90UdAAAAAElFTkSuQmCC'],
+                                  'first_doc_id': 5,
+                              })
+            j = a.json()
+            self.assertTrue('index' in j)
+            self.assertEqual(len(j['index']['docs']), 2)
+            self.assertEqual(j['index']['docs'][0]['docId'], 5)
+            self.assertEqual(j['index']['docs'][1]['docId'], 6)
+            self.assertEqual(j['index']['docs'][0]['dataUri'],
+                             'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAA2ElEQVR4nADIADf/AxWcWRUeCEeBO68T3u1qLWarHqMaxDnxhAEaLh0Ssu6ZGfnKcjP4CeDLoJok3o4aOPYAJocsjktZfo4Z7Q/WR1UTgppAAdguAhR+AUm9AnqRH2jgdBZ0R+kKxAFoAME32BL7fwQbcLzhw+dXMmY9BS9K8EarXyWLH8VYK1MACkxlLTY4Eh69XfjpROqjE7P0AeBx6DGmA8/lRRlTCmPkL196pC0aWBkVs2wyjqb/LABVYL8Xgeomjl3VtEMxAeaUrGvnIawVh/oBAAD///GwU6v3yCoVAAAAAElFTkSuQmCC')
+            self.assertEqual(a.status_code, 200)
+import multiprocessing as mp
+import os
+import time
+import unittest
+
+import numpy as np
+
+from jina.drivers.helper import array2pb
+from jina.enums import FlowOptimizeLevel, ClientInputType
+from jina.executors.indexers.vector.numpy import NumpyIndexer
+from jina.flow import Flow
+from jina.main.parser import set_gateway_parser
+from jina.peapods.pod import GatewayPod
+from jina.proto import jina_pb2
+from tests import JinaTestCase
+
+
+def random_docs(num_docs, chunks_per_doc=5, embed_dim=10):
+    c_id = 0
+    for j in range(num_docs):
+        d = jina_pb2.Document()
+        for k in range(chunks_per_doc):
+            c = d.chunks.add()
+            c.embedding.CopyFrom(array2pb(np.random.random([embed_dim])))
+            c.chunk_id = c_id
+            c.doc_id = j
+            c_id += 1
+        yield d
+
+
+def get_result(resp):
+    n = []
+    for d in resp.search.docs:
+        for c in d.chunks:
+            n.append([k.match_chunk.chunk_id for k in c.topk_results])
+    n = np.array(n)
+    # each chunk should return a list of top-100
+    np.testing.assert_equal(n.shape[0], 5)
+    np.testing.assert_equal(n.shape[1], 100)
+
+
+class DummyIndexer(NumpyIndexer):
+    # the add() function is simply copied from NumpyIndexer
+    def add(self, *args, **kwargs):
+        pass
+
+
+class DummyIndexer2(NumpyIndexer):
+    # the add() function is simply copied from NumpyIndexer
+    def add(self, keys: 'np.ndarray', vectors: 'np.ndarray', *args, **kwargs):
+        if len(vectors.shape) != 2:
+            raise ValueError('vectors shape %s is not valid, expecting "vectors" to have rank of 2' % vectors.shape)
+
+        if not self.num_dim:
+            self.num_dim = vectors.shape[1]
+            self.dtype = vectors.dtype.name
+        elif self.num_dim != vectors.shape[1]:
+            raise ValueError(
+                "vectors' shape [%d, %d] does not match with indexers's dim: %d" %
+                (vectors.shape[0], vectors.shape[1], self.num_dim))
+        elif self.dtype != vectors.dtype.name:
+            raise TypeError(
+                "vectors' dtype %s does not match with indexers's dtype: %s" %
+                (vectors.dtype.name, self.dtype))
+        elif keys.shape[0] != vectors.shape[0]:
+            raise ValueError('number of key %d not equal to number of vectors %d' % (keys.shape[0], vectors.shape[0]))
+        elif self.key_dtype != keys.dtype.name:
+            raise TypeError(
+                "keys' dtype %s does not match with indexers keys's dtype: %s" %
+                (keys.dtype.name, self.key_dtype))
+
+        self.write_handler.write(vectors.tobytes())
+        self.key_bytes += keys.tobytes()
+        self.key_dtype = keys.dtype.name
+        self._size += keys.shape[0]
+
+
+@unittest.skipIf('GITHUB_WORKFLOW' in os.environ, 'skip the network test on github workflow')
+class MyTestCase(JinaTestCase):
+
+    def tearDown(self) -> None:
+        super().tearDown()
+        time.sleep(2)
+
+    def test_index_remote(self):
+        f_args = set_gateway_parser().parse_args(['--allow-spawn'])
+
+        def start_gateway():
+            with GatewayPod(f_args):
+                time.sleep(20)
+
+        t = mp.Process(target=start_gateway)
+        t.daemon = True
+        t.start()
+
+        f = Flow().add(yaml_path='yaml/test-index.yml',
+                       replicas=3, separated_workspace=True,
+                       host='localhost', port_grpc=f_args.port_grpc)
+
+        with f:
+            f.index(input_fn=random_docs(1000), input_type=ClientInputType.PROTOBUF)
+
+        time.sleep(3)
+        for j in range(3):
+            self.assertTrue(os.path.exists(f'test2-{j + 1}/test2.bin'))
+            self.assertTrue(os.path.exists(f'test2-{j + 1}/tmp2'))
+            self.add_tmpfile(f'test2-{j + 1}/test2.bin', f'test2-{j + 1}/tmp2', f'test2-{j + 1}')
+
+    def test_index_remote_rpi(self):
+        f_args = set_gateway_parser().parse_args(['--allow-spawn'])
+
+        def start_gateway():
+            with GatewayPod(f_args):
+                time.sleep(50)
+
+        t = mp.Process(target=start_gateway)
+        t.daemon = True
+        t.start()
+
+        f = (Flow(optimize_level=FlowOptimizeLevel.IGNORE_GATEWAY)
+             .add(yaml_path='yaml/test-index.yml',
+                  replicas=3, separated_workspace=True,
+                  host='192.168.31.76', port_grpc=44444))
+
+        with f:
+            f.index(input_fn=random_docs(1000), input_type=ClientInputType.PROTOBUF)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import os
+
+from jina.logging.base import get_logger
+from tests import JinaTestCase
+
+
+class MyTestCase(JinaTestCase):
+
+    def test_logging_message(self):
+        os.environ['JINA_LOG_VERBOSITY'] = 'success'
+        logger = get_logger('test_logger')
+        logger.debug('this is test debug message')
+        logger.info('this is test info message')
+        logger.success('this is test success message')
+        logger.warning('this is test warning message')
+        logger.error('this is test error message')
+        logger.critical('this is test critical message')
+import os
+import threading
+import time
+import unittest
+from multiprocessing import Process
+
+from jina.logging import get_logger
+from jina.main.parser import set_gateway_parser, set_pea_parser, set_pod_parser
+from jina.peapods.pod import GatewayPod, BasePod
+from jina.peapods.remote import RemotePea, PodSpawnHelper, PeaSpawnHelper, MutablePodSpawnHelper, RemotePod, \
+    RemoteMutablePod
+from tests import JinaTestCase
+
+
+@unittest.skipIf('GITHUB_WORKFLOW' in os.environ, 'skip the network test on github workflow')
+class MyTestCase(JinaTestCase):
+    def test_logging_thread(self):
+        _event = threading.Event()
+        logger = get_logger('mytest', event_trigger=_event)
+
+        def _print_messages():
+            while True:
+                _event.wait()
+                print('thread: %s' % _event.record)
+                print(type(_event.record))
+                _event.clear()
+
+        t = threading.Thread(target=_print_messages)
+        t.daemon = True
+        t.start()
+
+        logger.info('blah, blah')
+        logger.info('blah, blah, blah')
+        time.sleep(.1)
+        logger.warning('warn, warn, warn')
+        time.sleep(.1)
+        logger.debug('warn, warn, warn')
+        time.sleep(.1)
+        logger.success('crit')
+        time.sleep(.1)
+
+    def test_remote_pod(self):
+        f_args = set_gateway_parser().parse_args(['--allow-spawn'])
+        p_args = set_pod_parser().parse_args(
+            ['--host', 'localhost', '--replicas', '3',
+             '--port-grpc', str(f_args.port_grpc)])
+
+        def start_gateway():
+            with GatewayPod(f_args):
+                time.sleep(5)
+
+        t = Process(target=start_gateway)
+        t.daemon = True
+        t.start()
+
+        PodSpawnHelper(p_args).start()
+        t.join()
+
+    def test_remote_pod_process(self):
+        f_args = set_gateway_parser().parse_args(['--allow-spawn'])
+        p_args = set_pod_parser().parse_args(
+            ['--host', 'localhost', '--replicas', '3',
+             '--port-grpc', str(f_args.port_grpc), '--runtime', 'process'])
+
+        def start_spawn():
+            PodSpawnHelper(p_args).start()
+
+        with GatewayPod(f_args):
+            t = Process(target=start_spawn)
+            t.daemon = True
+            t.start()
+
+            time.sleep(5)
+
+    def test_remote_two_pea(self):
+        # NOTE: right now there is no way to spawn two peas with one gateway!!!
+        f_args = set_gateway_parser().parse_args(['--allow-spawn'])
+
+        def start_gateway():
+            with GatewayPod(f_args):
+                time.sleep(5)
+
+        def start_client(d):
+            print('im running %d' % d)
+            p_args = set_pea_parser().parse_args(
+                ['--host', 'localhost', '--name', 'testpea%d' % d, '--port-grpc', str(f_args.port_grpc)])
+            PeaSpawnHelper(p_args).start()
+
+        t = Process(target=start_gateway)
+        t.daemon = True
+        t.start()
+
+        time.sleep(1)
+        c1 = Process(target=start_client, args=(1,))
+        c2 = Process(target=start_client, args=(2,))
+        c1.daemon = True
+        c2.daemon = True
+
+        c1.start()
+        c2.start()
+        time.sleep(5)
+        c1.join()
+        c2.join()
+
+    def tearDown(self) -> None:
+        time.sleep(2)
+        super().tearDown()
+
+    def test_customized_pod(self):
+        f_args = set_gateway_parser().parse_args(['--allow-spawn'])
+        p_args = set_pod_parser().parse_args(
+            ['--host', 'localhost', '--replicas', '3', '--port-grpc', str(f_args.port_grpc)])
+        p = BasePod(p_args)
+
+        def start_gateway():
+            with GatewayPod(f_args):
+                time.sleep(5)
+
+        t = Process(target=start_gateway)
+        t.daemon = True
+        t.start()
+
+        MutablePodSpawnHelper(p.peas_args).start()
+
+    @unittest.skipIf('GITHUB_WORKFLOW' in os.environ, 'skip the network test on github workflow')
+    def test_customized_pod2(self):
+        f_args = set_gateway_parser().parse_args(['--allow-spawn'])
+        p_args = set_pod_parser().parse_args(
+            ['--host', 'localhost', '--replicas', '3', '--port-grpc', str(f_args.port_grpc)])
+        p = BasePod(p_args)
+
+        def start_gateway():
+            with GatewayPod(f_args):
+                time.sleep(5)
+
+        t = Process(target=start_gateway)
+        t.daemon = True
+        t.start()
+
+        with RemoteMutablePod(p.peas_args):
+            pass
+        t.join()
+
+    @unittest.skipIf('GITHUB_WORKFLOW' in os.environ, 'skip the network test on github workflow')
+    def test_remote_pea2(self):
+        f_args = set_gateway_parser().parse_args(['--allow-spawn'])
+        p_args = set_pea_parser().parse_args(['--host', 'localhost', '--port-grpc', str(f_args.port_grpc)])
+
+        def start_gateway():
+            with GatewayPod(f_args):
+                time.sleep(5)
+
+        t = Process(target=start_gateway)
+        t.daemon = True
+        t.start()
+
+        with RemotePea(p_args):
+            pass
+        t.join()
+
+    @unittest.skipIf('GITHUB_WORKFLOW' in os.environ, 'skip the network test on github workflow')
+    def test_remote_pod2(self):
+        f_args = set_gateway_parser().parse_args(['--allow-spawn'])
+        p_args = set_pea_parser().parse_args(['--host', 'localhost', '--port-grpc', str(f_args.port_grpc)])
+
+        def start_gateway():
+            with GatewayPod(f_args):
+                time.sleep(5)
+
+        t = Process(target=start_gateway)
+        t.daemon = True
+        t.start()
+
+        with RemotePod(p_args):
+            pass
+        t.join()
+
+    def test_remote_pea(self):
+        f_args = set_gateway_parser().parse_args(['--allow-spawn'])
+
+        p_args = set_pea_parser().parse_args(['--host', 'localhost', '--port-grpc', str(f_args.port_grpc)])
+
+        def start_gateway():
+            with GatewayPod(f_args):
+                time.sleep(5)
+
+        t = Process(target=start_gateway)
+        t.daemon = True
+        t.start()
+
+        time.sleep(1)
+        PeaSpawnHelper(p_args).start()
+        t.join()
+
+
+if __name__ == '__main__':
+    unittest.main()
+import unittest
+
+from pkg_resources import resource_filename
+
+from jina.drivers import BaseDriver
+from jina.drivers.control import ControlReqDriver
+from jina.drivers.search import KVSearchDriver
+from jina.executors import BaseExecutor
+from jina.helper import yaml
+from jina.main.parser import set_pod_parser
+from jina.peapods import Pod
+from tests import JinaTestCase
+
+
+class MyTestCase(JinaTestCase):
+
+    def test_load_yaml1(self):
+        with open('yaml/test-driver.yml', encoding='utf8') as fp:
+            a = yaml.load(fp)
+
+        self.assertTrue(isinstance(a[0], KVSearchDriver))
+        self.assertTrue(isinstance(a[1], ControlReqDriver))
+        self.assertTrue(isinstance(a[2], BaseDriver))
+
+        with open('test_driver.yml', 'w', encoding='utf8') as fp:
+            yaml.dump(a[0], fp)
+
+        with open('test_driver.yml', encoding='utf8') as fp:
+            b = yaml.load(fp)
+
+        self.assertTrue(isinstance(b, KVSearchDriver))
+        self.assertEqual(b._executor_name, a[0]._executor_name)
+
+        self.add_tmpfile('test_driver.yml')
+
+    def test_load_cust_with_driver(self):
+        a = BaseExecutor.load_config('mwu-encoder/mwu_encoder_driver.yml')
+        self.assertEqual(a._drivers['ControlRequest'][0].__class__.__name__, 'MyAwesomeDriver')
+        p = set_pod_parser().parse_args(['--yaml-path', 'mwu-encoder/mwu_encoder_driver.yml'])
+        with Pod(p):
+            # will print a cust msg from the driver when terminate
+            pass
+
+    def test_pod_new_api_from_kwargs(self):
+        a = BaseExecutor.load_config('mwu-encoder/mwu_encoder_driver.yml')
+        self.assertEqual(a._drivers['ControlRequest'][0].__class__.__name__, 'MyAwesomeDriver')
+
+        with Pod(yaml_path='mwu-encoder/mwu_encoder_driver.yml'):
+            # will print a cust msg from the driver when terminate
+            pass
+
+    def test_load_yaml2(self):
+        a = BaseExecutor.load_config('yaml/test-exec-with-driver.yml')
+        self.assertEqual(len(a._drivers), 2)
+        # should be able to auto fill in ControlRequest
+        self.assertTrue('ControlRequest' in a._drivers)
+        a.save_config()
+        p = a.config_abspath
+        b = BaseExecutor.load_config(p)
+        self.assertEqual(a._drivers, b._drivers)
+        self.add_tmpfile(p)
+        a.touch()
+        a.save()
+        c = BaseExecutor.load(a.save_abspath)
+        self.assertEqual(a._drivers, c._drivers)
+        self.add_tmpfile(a.save_abspath)
+
+    def test_resource_executor(self):
+        a = BaseExecutor.load_config(resource_filename('jina', '/'.join(('resources', 'executors._route.yml'))))
+        self.assertEqual(a.name, 'route')
+        self.assertEqual(len(a._drivers), 4)
+        a = BaseExecutor.load_config(resource_filename('jina', '/'.join(('resources', 'executors._forward.yml'))))
+        self.assertEqual(a.name, 'forward')
+        self.assertEqual(len(a._drivers), 4)
+        a = BaseExecutor.load_config(resource_filename('jina', '/'.join(('resources', 'executors._merge.yml'))))
+        self.assertEqual(a.name, 'merge')
+        self.assertEqual(len(a._drivers), 4)
+        a = BaseExecutor.load_config(resource_filename('jina', '/'.join(('resources', 'executors._clear.yml'))))
+        self.assertEqual(a.name, 'clear')
+        self.assertEqual(len(a._drivers), 4)
+
+    def test_multiple_executor(self):
+        from jina.executors.encoders import BaseEncoder
+        from jina.executors.indexers import BaseIndexer
+        from jina.executors.rankers import BaseRanker
+        from jina.executors.crafters import BaseDocCrafter
+        from jina.executors.crafters import BaseChunkCrafter
+
+        class D1(BaseEncoder):
+            pass
+
+        d1 = D1()
+        self.assertEqual(len(d1._drivers), 4)
+
+        class D2(BaseIndexer):
+            pass
+
+        d2 = D2('dummy.bin')
+        self.assertEqual(len(d2._drivers), 1)
+
+        class D3(BaseRanker):
+            pass
+
+        d3 = D3()
+        self.assertEqual(len(d3._drivers), 2)
+
+        class D4(BaseDocCrafter):
+            pass
+
+        d4 = D4()
+        self.assertEqual(len(d4._drivers), 4)
+
+        class D5(BaseChunkCrafter):
+            pass
+
+        d5 = D5()
+        self.assertEqual(len(d5._drivers), 4)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import os
+
+from pkg_resources import resource_filename
+
+from jina.executors import BaseExecutor
+from jina.executors.metas import fill_metas_with_defaults
+from jina.helper import yaml, expand_dict
+from jina.main.parser import set_pea_parser
+from jina.peapods.pea import BasePea
+from tests import JinaTestCase
+
+
+class MyTestCase(JinaTestCase):
+
+    def test_yaml_expand(self):
+        with open('yaml/test-expand.yml') as fp:
+            a = yaml.load(fp)
+        b = expand_dict(a)
+        print(b)
+
+    def test_yaml_expand2(self):
+        with open('yaml/test-expand2.yml') as fp:
+            a = yaml.load(fp)
+        os.environ['ENV1'] = 'a'
+        b = expand_dict(a)
+        self.assertEqual(b['components'][0]['metas']['bad_var'], 'real-compound')
+        self.assertEqual(b['components'][1]['metas']['bad_var'], 2)
+        self.assertEqual(b['components'][1]['metas']['float_var'], 0.232)
+        self.assertEqual(b['components'][1]['metas']['mixed'], '0.232-2-real-compound')
+        self.assertEqual(b['components'][1]['metas']['mixed_env'], '0.232-a')
+        self.assertEqual(b['components'][1]['metas']['name_shortcut'], 'test_numpy')
+
+    def test_yaml_expand3(self):
+        with open('yaml/test-expand3.yml') as fp:
+            a = yaml.load(fp)
+        b = expand_dict(a)
+        print(b)
+
+    def test_attr_dict(self):
+        class AttrDict:
+            pass
+
+        a = AttrDict()
+        a.__dict__['sda'] = 1
+        self.assertEqual(a.sda, 1)
+        a.__dict__['components'] = list()
+        self.assertTrue(isinstance(a.components, list))
+
+    def test_yaml_fill(self):
+        with open('yaml/test-expand2.yml') as fp:
+            a = yaml.load(fp)
+        print(fill_metas_with_defaults(a))
+
+    def test_class_yaml(self):
+        class DummyClass:
+            pass
+
+        yaml.register_class(DummyClass)
+
+        a = yaml.load('!DummyClass {}')
+        self.assertEqual(type(a), DummyClass)
+
+        with open(resource_filename('jina',
+                                    '/'.join(('resources', 'executors.requests.%s.yml' % 'BaseExecutor')))) as fp:
+            b = fp.read()
+            print(b)
+            c = yaml.load(b)
+            print(c)
+
+        args = set_pea_parser().parse_args([])
+
+        with BasePea(args) as p:
+            pass
+
+        from jina.executors.requests import _defaults
+        self.assertIsNotNone(_defaults)
+
+    def test_joint_indexer(self):
+        b = BaseExecutor.load_config('yaml/test-joint.yml')
+        print(b[0].name)
+        print(type(b[0]))
+        print(b._drivers['SearchRequest'][0]._executor_name)
+        print(b._drivers['SearchRequest'])
+        b.attach(pea=None)
+        self.assertEqual(b._drivers['SearchRequest'][0]._exec, b[0])
+        self.assertEqual(b._drivers['SearchRequest'][-1]._exec, b[1])
+import unittest
+
+import ruamel.yaml
+
+from jina.helper import expand_env_var
+from jina.logging import default_logger
+from tests import JinaTestCase
+
+
+class MyTestCase(JinaTestCase):
+
+    def test_load_yaml1(self):
+        from jina.executors.indexers.vector.numpy import NumpyIndexer
+        NumpyIndexer.load_config('yaml/dummy_exec1.yml')
+        self.add_tmpfile('test.gzip')
+
+    def test_load_yaml2(self):
+        from jina.executors import BaseExecutor
+        a = BaseExecutor.load_config('yaml/dummy_exec1.yml')
+        a.close()
+        self.add_tmpfile('test.gzip')
+        b = BaseExecutor.load_config('yaml/dummy_exec1.yml')
+        b.save()
+        self.add_tmpfile(b.save_abspath)
+        b.save_config()
+        self.add_tmpfile(b.config_abspath)
+        b.close()
+
+    def test_load_external(self):
+        from jina.executors import BaseExecutor
+        self.assertRaises(ruamel.yaml.constructor.ConstructorError, BaseExecutor.load_config, 'yaml/dummy_ext_exec.yml')
+
+        b = BaseExecutor.load_config('yaml/dummy_ext_exec_sucess.yml')
+        self.assertEqual(b.__class__.__name__, 'DummyExternalIndexer')
+
+    def test_expand_env(self):
+        print(expand_env_var('${PATH}-${AA}'))
+        default_logger.info('aa')
+        default_logger.success('aa')
+
+
+if __name__ == '__main__':
+    unittest.main()
+import os
+import time
+from sys import platform
+
+from jina.enums import ClientInputType
+from jina.flow import Flow
+from jina.main.checker import NetworkChecker
+from jina.main.parser import set_pea_parser, set_ping_parser
+from jina.peapods.container import ContainerPea
+from jina.peapods.pea import BasePea
+from jina.proto import jina_pb2
+from tests import JinaTestCase
+
+
+def random_docs(num_docs, chunks_per_doc=5, embed_dim=10):
+    c_id = 0
+    for j in range(num_docs):
+        d = jina_pb2.Document()
+        for k in range(chunks_per_doc):
+            c = d.chunks.add()
+            c.text = 'i\'m chunk %d from doc %d' % (c_id, j)
+            c.chunk_id = c_id
+            c.doc_id = j
+            c_id += 1
+        yield d
+
+
+built = False
+img_name = 'jina/mwu-encoder'
+
+defaulthost = '0.0.0.0'
+localhost = defaulthost if (platform == "linux" or platform == "linux2") else 'host.docker.internal'
+
+
+def build_image():
+    if not built:
+        import docker
+        client = docker.from_env()
+        print(os.path.dirname(__file__))
+        client.images.build(path='mwu-encoder/', tag=img_name)
+        client.close()
+
+
+# @unittest.skipUnless(os.getenv('JINA_TEST_CONTAINER', False), 'skip the container test if not set')
+class MyTestCase(JinaTestCase):
+
+    def tearDown(self) -> None:
+        super().tearDown()
+        time.sleep(2)
+
+    def setUp(self) -> None:
+        super().setUp()
+        build_image()
+
+    def test_simple_container(self):
+        args = set_pea_parser().parse_args(['--image', img_name])
+        print(args)
+
+        with ContainerPea(args):
+            pass
+
+        time.sleep(2)
+        ContainerPea(args).start().close()
+
+    def test_simple_container_with_ext_yaml(self):
+        args = set_pea_parser().parse_args(['--image', img_name,
+                                            '--yaml-path', './mwu-encoder/mwu_encoder_ext.yml'])
+        print(args)
+
+        with ContainerPea(args):
+            time.sleep(2)
+
+    def test_flow_with_one_container_pod(self):
+        f = (Flow()
+             .add(name='dummyEncoder', image=img_name))
+
+        with f:
+            f.index(input_fn=random_docs(10), input_type=ClientInputType.PROTOBUF)
+
+    def test_flow_with_one_container_ext_yaml(self):
+        f = (Flow()
+             .add(name='dummyEncoder', image=img_name, yaml_path='./mwu-encoder/mwu_encoder_ext.yml'))
+
+        with f:
+            f.index(input_fn=random_docs(10), input_type=ClientInputType.PROTOBUF)
+
+    def test_flow_with_replica_container_ext_yaml(self):
+        f = (Flow()
+             .add(name='dummyEncoder',
+                  image=img_name,
+                  yaml_path='./mwu-encoder/mwu_encoder_ext.yml',
+                  replicas=3))
+
+        with f:
+            f.index(input_fn=random_docs(10), input_type=ClientInputType.PROTOBUF)
+            f.index(input_fn=random_docs(10), input_type=ClientInputType.PROTOBUF)
+            f.index(input_fn=random_docs(10), input_type=ClientInputType.PROTOBUF)
+
+    def test_flow_topo1(self):
+        f = (Flow()
+             .add(name='d1', image='jinaai/jina:devel', yaml_path='_logforward', entrypoint='jina pod')
+             .add(name='d2', image='jinaai/jina:devel', yaml_path='_logforward', entrypoint='jina pod')
+             .add(name='d3', image='jinaai/jina:devel', yaml_path='_logforward',
+                  needs='d1', entrypoint='jina pod')
+             .join(['d3', 'd2']))
+
+        with f:
+            f.index(input_fn=random_docs(10), input_type=ClientInputType.PROTOBUF)
+
+    def test_flow_topo_mixed(self):
+        f = (Flow()
+             .add(name='d1', image='jinaai/jina:devel', yaml_path='_logforward', entrypoint='jina pod')
+             .add(name='d2', yaml_path='_logforward')
+             .add(name='d3', image='jinaai/jina:devel', yaml_path='_logforward',
+                  needs='d1', entrypoint='jina pod')
+             .join(['d3', 'd2'])
+             )
+
+        with f:
+            f.index(input_fn=random_docs(10), input_type=ClientInputType.PROTOBUF)
+
+    def test_flow_topo_replicas(self):
+        f = (Flow()
+             .add(name='d1', image='jinaai/jina:devel', entrypoint='jina pod', yaml_path='_forward', replicas=3)
+             .add(name='d2', yaml_path='_forward', replicas=3)
+             .add(name='d3', image='jinaai/jina:devel', entrypoint='jina pod', yaml_path='_forward',
+                  needs='d1')
+             .join(['d3', 'd2'])
+             )
+
+        with f:
+            f.dry_run()
+            f.index(input_fn=random_docs(1000), input_type=ClientInputType.PROTOBUF)
+
+    def test_container_volume(self):
+        f = (Flow()
+             .add(name='dummyEncoder', image=img_name, volumes='./abc', yaml_path='mwu-encoder/mwu_encoder_upd.yml'))
+
+        with f:
+            f.index(input_fn=random_docs(10), input_type=ClientInputType.PROTOBUF)
+
+        out_file = './abc/ext-mwu-encoder.bin'
+        self.assertTrue(os.path.exists(out_file))
+        self.add_tmpfile(out_file, './abc')
+
+    def test_container_ping(self):
+        a4 = set_pea_parser().parse_args(['--image', img_name])
+        a5 = set_ping_parser().parse_args(['0.0.0.0', str(a4.port_ctrl), '--print-response'])
+
+        # test with container
+        with self.assertRaises(SystemExit) as cm:
+            with BasePea(a4):
+                NetworkChecker(a5)
+
+        self.assertEqual(cm.exception.code, 0)
+
+    def test_tail_host_docker2local_replicas(self):
+        f = (Flow()
+             .add(name='d1', image='jinaai/jina:devel', entrypoint='jina pod', yaml_path='_forward', replicas=3)
+             .add(name='d2', yaml_path='_forward'))
+        with f:
+            self.assertEqual(getattr(f._pod_nodes['d1'].peas_args['tail'], 'host_out'), defaulthost)
+            f.dry_run()
+
+    def test_tail_host_docker2local(self):
+        f = (Flow()
+             .add(name='d1', image='jinaai/jina:devel', entrypoint='jina pod', yaml_path='_forward')
+             .add(name='d2', yaml_path='_forward'))
+        with f:
+            self.assertEqual(getattr(f._pod_nodes['d1'].tail_args, 'host_out'), localhost)
+            f.dry_run()
+import threading
+import time
+import unittest
+
+from jina.logging import get_logger
+from jina.main.parser import set_gateway_parser, set_pea_parser
+from jina.peapods.pod import GatewayPod
+from jina.peapods.remote import PeaSpawnHelper
+from tests import JinaTestCase
+
+
+class MyTestCase(JinaTestCase):
+    def test_logging_thread(self):
+        _event = threading.Event()
+        logger = get_logger('mytest', event_trigger=_event)
+
+        def _print_messages():
+            while True:
+                _event.wait()
+                print('thread: %s' % _event.record)
+                print(type(_event.record))
+                _event.clear()
+
+        t = threading.Thread(target=_print_messages)
+        t.daemon = True
+        t.start()
+
+        logger.info('blah, blah')
+        logger.info('blah, blah, blah')
+        time.sleep(.1)
+        logger.warning('warn, warn, warn')
+        time.sleep(.1)
+        logger.debug('warn, warn, warn')
+        time.sleep(.1)
+        logger.success('crit')
+        time.sleep(.1)
+
+    def tearDown(self) -> None:
+        time.sleep(2)
+        super().tearDown()
+
+    def test_remote_not_allowed(self):
+        f_args = set_gateway_parser().parse_args([])
+
+        p_args = set_pea_parser().parse_args(['--host', 'localhost', '--port-grpc', str(f_args.port_grpc)])
+        with GatewayPod(f_args):
+            PeaSpawnHelper(p_args).start()
+
+    def test_cont_gateway(self):
+        f1_args = set_gateway_parser().parse_args(['--allow-spawn'])
+        f2_args = set_gateway_parser().parse_args([])
+        with GatewayPod(f1_args):
+            pass
+
+        with GatewayPod(f2_args):
+            pass
+
+
+if __name__ == '__main__':
+    unittest.main()
+import multiprocessing as mp
+import os
+import time
+import unittest
+
+import numpy as np
+
+from jina.drivers.helper import array2pb
+from jina.enums import FlowOptimizeLevel, ClientInputType
+from jina.executors.indexers.vector.numpy import NumpyIndexer
+from jina.flow import Flow
+from jina.main.parser import set_flow_parser
+from jina.proto import jina_pb2
+from tests import JinaTestCase
+
+
+def random_docs(num_docs, chunks_per_doc=5, embed_dim=10):
+    c_id = 0
+    for j in range(num_docs):
+        d = jina_pb2.Document()
+        for k in range(chunks_per_doc):
+            c = d.chunks.add()
+            c.embedding.CopyFrom(array2pb(np.random.random([embed_dim])))
+            c.chunk_id = c_id
+            c.doc_id = j
+            c_id += 1
+        yield d
+
+
+def get_result(resp):
+    n = []
+    for d in resp.search.docs:
+        for c in d.chunks:
+            n.append([k.match_chunk.chunk_id for k in c.topk_results])
+    n = np.array(n)
+    # each chunk should return a list of top-100
+    np.testing.assert_equal(n.shape[0], 5)
+    np.testing.assert_equal(n.shape[1], 100)
+
+
+class DummyIndexer(NumpyIndexer):
+    # the add() function is simply copied from NumpyIndexer
+    def add(self, *args, **kwargs):
+        pass
+
+
+class DummyIndexer2(NumpyIndexer):
+    # the add() function is simply copied from NumpyIndexer
+    def add(self, keys: 'np.ndarray', vectors: 'np.ndarray', *args, **kwargs):
+        if len(vectors.shape) != 2:
+            raise ValueError('vectors shape %s is not valid, expecting "vectors" to have rank of 2' % vectors.shape)
+
+        if not self.num_dim:
+            self.num_dim = vectors.shape[1]
+            self.dtype = vectors.dtype.name
+        elif self.num_dim != vectors.shape[1]:
+            raise ValueError(
+                "vectors' shape [%d, %d] does not match with indexers's dim: %d" %
+                (vectors.shape[0], vectors.shape[1], self.num_dim))
+        elif self.dtype != vectors.dtype.name:
+            raise TypeError(
+                "vectors' dtype %s does not match with indexers's dtype: %s" %
+                (vectors.dtype.name, self.dtype))
+        elif keys.shape[0] != vectors.shape[0]:
+            raise ValueError('number of key %d not equal to number of vectors %d' % (keys.shape[0], vectors.shape[0]))
+        elif self.key_dtype != keys.dtype.name:
+            raise TypeError(
+                "keys' dtype %s does not match with indexers keys's dtype: %s" %
+                (keys.dtype.name, self.key_dtype))
+
+        self.write_handler.write(vectors.tobytes())
+        self.key_bytes += keys.tobytes()
+        self.key_dtype = keys.dtype.name
+        self._size += keys.shape[0]
+
+
+class MyTestCase(JinaTestCase):
+
+    def tearDown(self) -> None:
+        super().tearDown()
+        time.sleep(2)
+
+    def test_doc_iters(self):
+        a = random_docs(3, 5)
+        for d in a:
+            print(d)
+
+    def test_simple_route(self):
+        f = Flow().add(yaml_path='_forward')
+        with f:
+            f.index(input_fn=random_docs(10), input_type=ClientInputType.PROTOBUF)
+
+    def test_update_method(self):
+        a = DummyIndexer(index_filename='test.bin')
+        a.save()
+        self.assertFalse(os.path.exists(a.save_abspath))
+        self.assertFalse(os.path.exists(a.index_abspath))
+        a.add()
+        a.save()
+        self.assertTrue(os.path.exists(a.save_abspath))
+        self.assertFalse(os.path.exists(a.index_abspath))
+        self.add_tmpfile(a.save_abspath, a.index_abspath)
+
+        b = DummyIndexer2(index_filename='testb.bin')
+        b.save()
+        self.assertFalse(os.path.exists(b.save_abspath))
+        self.assertFalse(os.path.exists(b.index_abspath))
+        b.add(np.array([1, 2, 3]), np.array([[1, 1, 1], [2, 2, 2]]))
+        b.save()
+        self.assertTrue(os.path.exists(b.save_abspath))
+        self.assertTrue(os.path.exists(b.index_abspath))
+        self.add_tmpfile(b.save_abspath, b.index_abspath)
+
+    @unittest.skipIf('GITHUB_WORKFLOW' in os.environ, 'skip the network test on github workflow')
+    def test_two_client_route_replicas(self):
+        fa1 = set_flow_parser().parse_args(['--optimize-level', str(FlowOptimizeLevel.NONE)])
+        f1 = Flow(fa1).add(yaml_path='_forward', replicas=3)
+        f2 = Flow(optimize_level=FlowOptimizeLevel.IGNORE_GATEWAY).add(yaml_path='_forward', replicas=3)
+
+        # f3 = Flow(optimize_level=FlowOptimizeLevel.FULL).add(yaml_path='_forward', replicas=3)
+
+        def start_client(fl):
+            fl.index(input_fn=random_docs(10), input_type=ClientInputType.PROTOBUF)
+
+        with f1:
+            self.assertEqual(f1.num_peas, 6)
+            t1 = mp.Process(target=start_client, args=(f1,))
+            t1.daemon = True
+            t2 = mp.Process(target=start_client, args=(f1,))
+            t2.daemon = True
+
+            t1.start()
+            t2.start()
+            time.sleep(5)
+
+        with f2:
+            self.assertEqual(f2.num_peas, 6)
+            t1 = mp.Process(target=start_client, args=(f2,))
+            t1.daemon = True
+            t2 = mp.Process(target=start_client, args=(f2,))
+            t2.daemon = True
+
+            t1.start()
+            t2.start()
+            time.sleep(5)
+
+        # with f3.build() as fl3:
+        #     self.assertEqual(fl3.num_peas, 4)
+
+    @unittest.skipIf('GITHUB_WORKFLOW' in os.environ, 'skip the network test on github workflow')
+    def test_two_client_route(self):
+        f = Flow().add(yaml_path='_forward')
+
+        def start_client(fl):
+            fl.index(input_fn=random_docs(10), input_type=ClientInputType.PROTOBUF)
+
+        with f:
+            t1 = mp.Process(target=start_client, args=(f,))
+            t1.daemon = True
+            t2 = mp.Process(target=start_client, args=(f,))
+            t2.daemon = True
+
+            t1.start()
+            t2.start()
+            time.sleep(5)
+
+    def test_index(self):
+        f = Flow().add(yaml_path='yaml/test-index.yml', replicas=3, separated_workspace=True)
+        with f:
+            f.index(input_fn=random_docs(1000), input_type=ClientInputType.PROTOBUF)
+
+        for j in range(3):
+            self.assertTrue(os.path.exists(f'test2-{j + 1}/test2.bin'))
+            self.assertTrue(os.path.exists(f'test2-{j + 1}/tmp2'))
+            self.add_tmpfile(f'test2-{j + 1}/test2.bin', f'test2-{j + 1}/tmp2', f'test2-{j + 1}')
+
+        time.sleep(3)
+        with f:
+            f.search(input_fn=random_docs(1), input_type=ClientInputType.PROTOBUF, output_fn=get_result, top_k=100)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import unittest
+
+import requests
+
+from jina import JINA_GLOBAL
+from jina.enums import FlowOptimizeLevel, ClientInputType
+from jina.flow import Flow
+from jina.main.checker import NetworkChecker
+from jina.main.parser import set_pea_parser, set_ping_parser
+from jina.main.parser import set_pod_parser
+from jina.peapods.pea import BasePea
+from jina.peapods.pod import BasePod
+from jina.proto import jina_pb2
+from tests import JinaTestCase
+
+
+def random_docs(num_docs, chunks_per_doc=5, embed_dim=10):
+    c_id = 0
+    for j in range(num_docs):
+        d = jina_pb2.Document()
+        for k in range(chunks_per_doc):
+            c = d.chunks.add()
+            c.text = 'i\'m chunk %d from doc %d' % (c_id, j)
+            c.chunk_id = c_id
+            c.doc_id = j
+            c_id += 1
+        d.meta_info = b'hello world'
+        yield d
+
+
+def random_queries(num_docs, chunks_per_doc=5, embed_dim=10):
+    for j in range(num_docs):
+        d = jina_pb2.Document()
+        for k in range(chunks_per_doc):
+            dd = d.topk_results.add()
+            dd.match_doc.doc_id = k
+        yield d
+
+
+class MyTestCase(JinaTestCase):
+
+    def test_ping(self):
+        a1 = set_pea_parser().parse_args([])
+        a2 = set_ping_parser().parse_args(['0.0.0.0', str(a1.port_ctrl), '--print-response'])
+        a3 = set_ping_parser().parse_args(['0.0.0.1', str(a1.port_ctrl), '--timeout', '1000'])
+
+        with self.assertRaises(SystemExit) as cm:
+            with BasePea(a1):
+                NetworkChecker(a2)
+
+        self.assertEqual(cm.exception.code, 0)
+
+        # test with bad addresss
+        with self.assertRaises(SystemExit) as cm:
+            with BasePea(a1):
+                NetworkChecker(a3)
+
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_flow_with_jump(self):
+        f = (Flow().add(name='r1', yaml_path='_forward')
+             .add(name='r2', yaml_path='_forward')
+             .add(name='r3', yaml_path='_forward', needs='r1')
+             .add(name='r4', yaml_path='_forward', needs='r2')
+             .add(name='r5', yaml_path='_forward', needs='r3')
+             .add(name='r6', yaml_path='_forward', needs='r4')
+             .add(name='r8', yaml_path='_forward', needs='r6')
+             .add(name='r9', yaml_path='_forward', needs='r5')
+             .add(name='r10', yaml_path='_merge', needs=['r9', 'r8']))
+
+        with f:
+            f.dry_run()
+        f.save_config('tmp.yml')
+        Flow.load_config('tmp.yml')
+
+        with Flow.load_config('tmp.yml') as fl:
+            fl.dry_run()
+
+        self.add_tmpfile('tmp.yml')
+
+    def test_simple_flow(self):
+        bytes_gen = (b'aaa' for _ in range(10))
+
+        def bytes_fn():
+            for _ in range(100):
+                yield b'aaa'
+
+        f = (Flow()
+             .add(yaml_path='_forward'))
+
+        with f:
+            f.index(input_fn=bytes_gen)
+
+        with f:
+            f.index(input_fn=bytes_fn)
+
+        with f:
+            f.index(input_fn=bytes_fn)
+            f.index(input_fn=bytes_fn)
+
+    def test_load_flow_from_yaml(self):
+        with open('yaml/test-flow.yml') as fp:
+            a = Flow.load_config(fp)
+            with open('yaml/swarm-out.yml', 'w') as fp, a:
+                a.to_swarm_yaml(fp)
+            self.add_tmpfile('yaml/swarm-out.yml')
+
+    def test_flow_identical(self):
+        with open('yaml/test-flow.yml') as fp:
+            a = Flow.load_config(fp)
+
+        b = (Flow()
+             .add(name='chunk_seg', replicas=3)
+             .add(name='wqncode1', replicas=2)
+             .add(name='encode2', replicas=2, needs='chunk_seg')
+             .join(['wqncode1', 'encode2']))
+
+        a.save_config('test2.yml')
+
+        c = Flow.load_config('test2.yml')
+
+        self.assertEqual(a, b)
+        self.assertEqual(a, c)
+        self.add_tmpfile('test2.yml')
+
+    def test_dryrun(self):
+        f = (Flow()
+             .add(name='dummyEncoder', yaml_path='mwu-encoder/mwu_encoder.yml'))
+
+        with f:
+            f.dry_run()
+
+    def test_pod_status(self):
+        args = set_pod_parser().parse_args(['--replicas', '3'])
+        with BasePod(args) as p:
+            self.assertEqual(len(p.status), p.num_peas)
+            for v in p.status:
+                self.assertIsNotNone(v)
+
+    def test_flow_no_container(self):
+        f = (Flow()
+             .add(name='dummyEncoder', yaml_path='mwu-encoder/mwu_encoder.yml'))
+
+        with f:
+            f.index(input_fn=random_docs(10), input_type=ClientInputType.PROTOBUF)
+
+    def test_flow_yaml_dump(self):
+        f = Flow(logserver_config='yaml/test-server-config.yml',
+                 optimize_level=FlowOptimizeLevel.IGNORE_GATEWAY,
+                 no_gateway=True)
+        f.save_config('test1.yml')
+
+        fl = Flow.load_config('test1.yml')
+        self.assertEqual(f.args.logserver_config, fl.args.logserver_config)
+        self.assertEqual(f.args.optimize_level, fl.args.optimize_level)
+        self.add_tmpfile('test1.yml')
+
+    def test_flow_log_server(self):
+        f = Flow.load_config('yaml/test_log_server.yml')
+        with f:
+            self.assertTrue(hasattr(JINA_GLOBAL.logserver, 'ready'))
+            a = requests.get(JINA_GLOBAL.logserver.ready, timeout=5)
+            self.assertEqual(a.status_code, 200)
+
+    def test_shards(self):
+        f = Flow().add(name='doc_pb', yaml_path='yaml/test-docpb.yml', replicas=3, separated_workspace=True)
+        with f:
+            f.index(input_fn=random_docs(1000), input_type=ClientInputType.PROTOBUF, random_doc_id=False)
+        with f:
+            pass
+        self.add_tmpfile('test-docshard')
+
+    def test_shards_insufficient_data(self):
+        index_docs = 3
+        replicas = 4
+
+        def validate(req):
+            self.assertEqual(len(req.docs), 1)
+            self.assertEqual(len(req.docs[0].topk_results), index_docs)
+
+            for d in req.docs[0].topk_results:
+                self.assertTrue(hasattr(d.match_doc, 'weight'))
+                self.assertIsNotNone(d.match_doc.weight)
+                self.assertEqual(d.match_doc.meta_info, b'hello world')
+
+        f = Flow().add(name='doc_pb', yaml_path='yaml/test-docpb.yml', replicas=replicas, separated_workspace=True)
+        with f:
+            f.index(input_fn=random_docs(index_docs), input_type=ClientInputType.PROTOBUF, random_doc_id=False)
+        with f:
+            pass
+        f = Flow().add(name='doc_pb', yaml_path='yaml/test-docpb.yml', replicas=replicas,
+                       separated_workspace=True, polling='all', reducing_yaml_path='_merge_topk_docs')
+        with f:
+            f.search(input_fn=random_queries(1, index_docs), input_type=ClientInputType.PROTOBUF, random_doc_id=False, output_fn=validate,
+                     callback_on_body=True)
+        self.add_tmpfile('test-docshard')
+
+    def test_py_client(self):
+        f = (Flow().add(name='r1', yaml_path='_forward')
+             .add(name='r2', yaml_path='_forward')
+             .add(name='r3', yaml_path='_forward', needs='r1')
+             .add(name='r4', yaml_path='_forward', needs='r2')
+             .add(name='r5', yaml_path='_forward', needs='r3')
+             .add(name='r6', yaml_path='_forward', needs='r4')
+             .add(name='r8', yaml_path='_forward', needs='r6')
+             .add(name='r9', yaml_path='_forward', needs='r5')
+             .add(name='r10', yaml_path='_merge', needs=['r9', 'r8']))
+
+        with f:
+            f.dry_run()
+            from jina.clients import py_client
+            py_client(port_grpc=f.port_grpc, host=f.host).dry_run()
+
+    def test_dry_run_with_two_pathways_diverging_at_gateway(self):
+        f = (Flow().add(name='r2', yaml_path='_forward')
+             .add(name='r3', yaml_path='_forward', needs='gateway')
+             .join(['r2', 'r3']))
+        for p in f.build():
+            print(f'{p.name} in: {str(p.head_args.socket_in)} out: {str(p.head_args.socket_out)}')
+        with f:
+            f.dry_run()
+
+    def test_dry_run_with_two_pathways_diverging_at_non_gateway(self):
+        f = (Flow().add(name='r1', yaml_path='_forward')
+             .add(name='r2', yaml_path='_forward')
+             .add(name='r3', yaml_path='_forward', needs='r1')
+             .join(['r2', 'r3']))
+
+        a = f.build()
+        for p in a:
+            print(f'{p.name} in: {str(p.head_args.socket_in)} out: {str(p.head_args.socket_out)}')
+        with f:
+            f.dry_run()
+
+
+if __name__ == '__main__':
+    unittest.main()
+import os
+
+import numpy as np
+
+from jina.executors import BaseExecutor
+from tests import JinaTestCase
+
+
+class MyTestCase(JinaTestCase):
+
+    def test_share_workspace(self):
+        for j in range(3):
+            a = BaseExecutor.load_config('yaml/test-workspace.yml', True, j)
+            a.touch()
+            a.save()
+            self.assertTrue(os.path.exists('%s-%s/%s.bin' % (a.name, j, a.name)))
+            self.add_tmpfile('%s-%s/%s.bin' % (a.name, j, a.name))
+            self.add_tmpfile('%s-%s' % (a.name, j))
+
+    def test_compound_workspace(self):
+        for j in range(3):
+            a = BaseExecutor.load_config('yaml/test-compound-workspace.yml', True, j)
+            for c in a.components:
+                c.touch()
+                c.save()
+                self.assertTrue(os.path.exists('%s-%s/%s.bin' % (a.name, j, c.name)))
+                self.add_tmpfile('%s-%s/%s.bin' % (a.name, j, c.name))
+            a.touch()
+            a.save()
+            self.assertTrue(os.path.exists('%s-%s/%s.bin' % (a.name, j, a.name)))
+            self.add_tmpfile('%s-%s/%s.bin' % (a.name, j, a.name))
+            self.add_tmpfile('%s-%s' % (a.name, j))
+
+    def test_compound_indexer(self):
+        all_subspace = set()
+        for j in range(3):
+            a = BaseExecutor.load_config('yaml/test-compound-indexer.yml', True, j)
+            for c in a:
+                c.touch()
+                print(c.save_abspath)
+                print(c.index_abspath)
+                c.save()
+                self.assertTrue(os.path.exists(c.save_abspath))
+                self.assertTrue(os.path.exists(c.index_abspath))
+                self.add_tmpfile(c.save_abspath, c.index_abspath)
+
+                self.assertTrue(c.save_abspath.startswith(a.current_workspace))
+                self.assertTrue(c.index_abspath.startswith(a.current_workspace))
+            a.touch()
+            a.save()
+            self.assertTrue(os.path.exists(a.save_abspath))
+            self.add_tmpfile(a.save_abspath)
+            self.add_tmpfile(a.current_workspace)
+            all_subspace.add(a.current_workspace)
+
+        self.assertEqual(len(all_subspace), 3)
+
+    def test_compound_indexer_rw(self):
+        all_vecs = np.random.random([6, 5])
+        for j in range(3):
+            a = BaseExecutor.load_config('yaml/test-compound-indexer2.yml', True, j)
+            self.assertEqual(a[0], a['test_meta'])
+            self.assertFalse(a[0].is_updated)
+            self.assertFalse(a.is_updated)
+            a[0].add(j)
+            self.assertTrue(a[0].is_updated)
+            self.assertTrue(a.is_updated)
+            self.assertFalse(a[1].is_updated)
+            a[1].add(np.array([j * 2, j * 2 + 1]), all_vecs[(j * 2, j * 2 + 1), :])
+            self.assertTrue(a[1].is_updated)
+            a.save()
+            # the compound executor itself is not modified, therefore should not generate a save
+            self.assertFalse(os.path.exists(a.save_abspath))
+            self.assertTrue(os.path.exists(a[0].save_abspath))
+            self.assertTrue(os.path.exists(a[0].index_abspath))
+            self.assertTrue(os.path.exists(a[1].save_abspath))
+            self.assertTrue(os.path.exists(a[1].index_abspath))
+            self.add_tmpfile(a[0].save_abspath, a[1].save_abspath, a[0].index_abspath, a[1].index_abspath,
+                             a.current_workspace)
+
+        recovered_vecs = []
+        for j in range(3):
+            a = BaseExecutor.load_config('yaml/test-compound-indexer2.yml', True, j)
+            recovered_vecs.append(a[1].query_handler)
+
+        np.testing.assert_almost_equal(all_vecs, np.concatenate(recovered_vecs))
+import os
+import subprocess
+import unittest
+from pathlib import Path
+
+from jina.clients import py_client
+from jina.flow import Flow
+from jina.helloworld import download_data, input_fn
+from jina.main.parser import set_hw_parser
+from pkg_resources import resource_filename
+from tests import JinaTestCase
+
+
+class MyTestCase(JinaTestCase):
+
+    def test_cli(self):
+        for j in ('pod', 'pea', 'gateway', 'log',
+                  'check', 'ping', 'client', 'flow', 'hello-world', 'export-api'):
+            subprocess.check_call(['jina', j, '--help'])
+        subprocess.check_call(['jina'])
+
+    def test_helloworld(self):
+        subprocess.check_call(['jina', 'hello-world'])
+
+    @unittest.skipIf('GITHUB_WORKFLOW' in os.environ, 'skip the network test on github workflow')
+    def test_helloworld_py(self):
+        from jina.main.parser import set_hw_parser
+        from jina.helloworld import hello_world
+        hello_world(set_hw_parser().parse_args([]))
+
+    @unittest.skipIf('GITHUB_WORKFLOW' in os.environ, 'skip the network test on github workflow')
+    def test_helloworld_flow(self):
+        args = set_hw_parser().parse_args([])
+
+        os.environ['RESOURCE_DIR'] = resource_filename('jina', 'resources')
+        os.environ['SHARDS'] = str(args.shards)
+        os.environ['REPLICAS'] = str(args.replicas)
+        os.environ['HW_WORKDIR'] = args.workdir
+        os.environ['WITH_LOGSERVER'] = str(args.logserver)
+
+        f = Flow.load_config(resource_filename('jina', '/'.join(('resources', 'helloworld.flow.index.yml'))))
+
+        targets = {
+            'index': {
+                'url': args.index_data_url,
+                'filename': os.path.join(args.workdir, 'index-original')
+            },
+            'query': {
+                'url': args.query_data_url,
+                'filename': os.path.join(args.workdir, 'query-original')
+            }
+        }
+
+        # download the data
+        Path(args.workdir).mkdir(parents=True, exist_ok=True)
+        download_data(targets)
+
+        # run it!
+        with f:
+            py_client(host=f.host,
+                      port_grpc=f.port_grpc,
+                      ).index(input_fn(targets['index']['filename']), batch_size=args.index_batch_size)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import os
+import shutil
+import sys
+import unittest
+from os.path import dirname
+
+
+class JinaTestCase(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.tmp_files = []
+        os.environ['TEST_WORKDIR'] = os.getcwd()
+
+    def tearDown(self) -> None:
+        for k in self.tmp_files:
+            if os.path.exists(k):
+                if os.path.isfile(k):
+                    os.remove(k)
+                elif os.path.isdir(k):
+                    shutil.rmtree(k, ignore_errors=False, onerror=None)
+
+    def add_tmpfile(self, *path):
+        self.tmp_files.extend(path)
+
+
+file_dir = os.path.dirname(__file__)
+sys.path.append(dirname(file_dir))
+import os
+import time
+
+import numpy as np
+
+from jina.drivers.helper import array2pb
+from jina.enums import SchedulerType, ClientInputType
+from jina.executors.crafters import BaseDocCrafter
+from jina.flow import Flow
+from jina.proto import jina_pb2
+from tests import JinaTestCase
+
+
+def random_docs(num_docs, chunks_per_doc=5, embed_dim=10):
+    c_id = 0
+    for j in range(num_docs):
+        d = jina_pb2.Document()
+        for k in range(chunks_per_doc):
+            c = d.chunks.add()
+            c.embedding.CopyFrom(array2pb(np.random.random([embed_dim])))
+            c.chunk_id = c_id
+            c.doc_id = j
+            c_id += 1
+        yield d
+
+
+class SlowWorker(BaseDocCrafter):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # half of worker is slow
+        self.is_slow = os.getpid() % 2 != 0
+        self.logger.warning('im a slow worker')
+
+    def craft(self, doc_id, *args, **kwargs):
+        if self.is_slow:
+            self.logger.warning('slowly doing')
+            time.sleep(1)
+        return {'doc_id': doc_id}
+
+
+class MyTestCase(JinaTestCase):
+    def test_lb(self):
+        f = Flow(runtime='process').add(
+            name='sw',
+            yaml_path='SlowWorker',
+            replicas=10)
+        with f:
+            f.index(input_fn=random_docs(100), input_type=ClientInputType.PROTOBUF, batch_size=10)
+
+    def test_roundrobin(self):
+        f = Flow(runtime='process').add(
+            name='sw',
+            yaml_path='SlowWorker',
+            replicas=10, scheduling=SchedulerType.ROUND_ROBIN)
+        with f:
+            f.index(input_fn=random_docs(100), input_type=ClientInputType.PROTOBUF, batch_size=10)
+from jina.helper import register_port, get_registered_ports, deregister_all_ports
+from tests import JinaTestCase
+
+
+class MyTestCase(JinaTestCase):
+
+    def test_port_registration(self):
+        register_port(5555)
+        register_port(5556)
+        register_port(5557)
+        register_port(5555)
+
+        self.assertEqual(get_registered_ports(), [5555, 5556, 5557])
+        deregister_all_ports()
+        self.assertEqual(get_registered_ports(), [])
+from typing import Any
+
+import numpy as np
+
+from jina.executors.encoders import BaseEncoder
+
+
+class MWUEncoder(BaseEncoder):
+
+    def __init__(self, greetings: str, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._greetings = greetings
+
+    def encode(self, data: Any, *args, **kwargs) -> Any:
+        self.logger.info('%s %s' % (self._greetings, data))
+        return np.random.random([data.shape[0], 3])
+
+
+class MWUUpdater(BaseEncoder):
+
+    def __init__(self, greetings: str, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._greetings = greetings
+
+    def encode(self, data: Any, *args, **kwargs) -> Any:
+        self.is_updated = True
+        return np.random.random([data.shape[0], 3])
+from jina.drivers.control import ControlReqDriver
+
+
+class MyAwesomeDriver(ControlReqDriver):
+    def __call__(self, *args, **kwargs):
+        print('hello from customized drivers')
+        super().__call__(*args, **kwargs)
+import os
+import unittest
+
+from jina.executors import BaseExecutor
+from jina.executors.compound import CompoundExecutor
+from tests import JinaTestCase
+
+
+class dummyA(BaseExecutor):
+    def say(self):
+        return 'a'
+
+    def sayA(self):
+        print('A: im A')
+
+
+class dummyB(BaseExecutor):
+    def say(self):
+        return 'b'
+
+    def sayB(self):
+        print('B: im B')
+
+
+class MyTestCase(JinaTestCase):
+    def test_compositional_route(self):
+        da = dummyA()
+        db = dummyB()
+        a = CompoundExecutor()
+
+        a.components = lambda: [da, db]
+        self.assertEqual(a.say_all(), ['a', 'b'])
+        with self.assertRaises(AttributeError):
+            a.say()
+
+        b = CompoundExecutor({'say': {da.name: 'say'}})
+        b.components = lambda: [da, db]
+        self.assertEqual(b.say_all(), ['a', 'b'])
+        self.assertEqual(b.say(), 'a')
+        b.add_route('say', db.name, 'say')
+        self.assertEqual(b.say(), 'b')
+        b.save_config()
+        self.assertTrue(os.path.exists(b.config_abspath))
+
+        c = BaseExecutor.load_config(b.config_abspath)
+        self.assertEqual(c.say_all(), ['a', 'b'])
+        self.assertEqual(c.say(), 'a')
+
+        b.add_route('say', db.name, 'say', is_stored=True)
+        b.save_config()
+        c = BaseExecutor.load_config(b.config_abspath)
+        self.assertEqual(c.say_all(), ['a', 'b'])
+        self.assertEqual(c.say(), 'b')
+
+        b.touch()
+        b.save()
+        self.assertTrue(os.path.exists(b.save_abspath))
+
+        d = BaseExecutor.load(b.save_abspath)
+        self.assertEqual(d.say_all(), ['a', 'b'])
+        self.assertEqual(d.say(), 'b')
+
+        self.tmp_files.append(b.config_abspath)
+        self.tmp_files.append(b.save_abspath)
+
+    def test_compositional_dump(self):
+        a = CompoundExecutor()
+        a.components = lambda: [BaseExecutor(), BaseExecutor()]
+        self.assertIsNotNone(a.name)
+        self.tmp_files.append(a.save_abspath)
+        self.tmp_files.append(a.config_abspath)
+        a.touch()
+        a.save()
+        a.save_config()
+        self.assertTrue(os.path.exists(a.save_abspath))
+        self.assertTrue(os.path.exists(a.config_abspath))
+
+    def test_compound_from_yaml(self):
+        a = BaseExecutor.load_config('../yaml/npvec.yml')
+        for c in a.components:
+            self.add_tmpfile(c.index_abspath)
+        self.assertTrue(isinstance(a, CompoundExecutor))
+        self.assertTrue(callable(getattr(a, 'add')))
+        self.assertTrue(callable(getattr(a, 'query')))
+        self.assertTrue(callable(getattr(a, 'meta_add')))
+        self.assertTrue(callable(getattr(a, 'meta_query')))
+
+
+if __name__ == '__main__':
+    unittest.main()
+import os
+from jina.executors.metas import get_default_metas
+from tests import JinaTestCase
+
+
+class ExecutorTestCase(JinaTestCase):
+    @property
+    def metas(self):
+        metas = get_default_metas()
+        if 'JINA_TEST_GPU' in os.environ:
+            metas['on_gpu'] = True
+        return metas
+import unittest
+
+from jina.executors.rankers.tfidf import BM25Ranker
+from tests.executors.rankers import RankerTestCase
+
+
+class MyTestCase(RankerTestCase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ranker = BM25Ranker()
+
+
+if __name__ == '__main__':
+    unittest.main()
+import unittest
+
+from jina.executors.rankers.bi_match import BiMatchRanker
+from tests.executors.rankers import RankerTestCase
+
+
+class MyTestCase(RankerTestCase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ranker = BiMatchRanker()
+
+
+if __name__ == '__main__':
+    unittest.main()
+import unittest
+
+from jina.executors.rankers import MaxRanker
+from tests.executors.rankers import RankerTestCase
+
+
+class MyTestCase(RankerTestCase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ranker = MaxRanker()
+
+
+if __name__ == '__main__':
+    unittest.main()
+import numpy as np
+
+from tests import JinaTestCase
+
+
+class RankerTestCase(JinaTestCase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ranker = None
+
+    def create_data(self):
+        query_chunk2match_chunk = {
+            100: [
+                {'doc_id': 1, 'chunk_id': 10, 'score': 0.4, 'length': 200},
+            ],
+            110: [
+                {'doc_id': 1, 'chunk_id': 10, 'score': 0.3, 'length': 200},
+                {'doc_id': 1, 'chunk_id': 11, 'score': 0.2, 'length': 200},
+                {'doc_id': 4294967294, 'chunk_id': 20, 'score': 0.1, 'length': 300},
+            ]
+        }
+        query_chunk_meta = {}
+        match_chunk_meta = {}
+        match_idx = []
+        num_query_chunks = len(query_chunk2match_chunk)
+        for query_chunk_id, match_chunks in query_chunk2match_chunk.items():
+            query_chunk_meta[query_chunk_id] = {'length': num_query_chunks}
+            for c in match_chunks:
+                match_chunk_meta[c['chunk_id']] = {'length': c['length']}
+                match_idx.append([
+                    c['doc_id'],
+                    c['chunk_id'],
+                    query_chunk_id,
+                    c['score'],
+                ])
+        return np.array(match_idx), query_chunk_meta, match_chunk_meta
+
+    def test_ranker(self):
+        match_idx, query_chunk_meta, match_chunk_meta = self.create_data()
+        doc_idx = self.ranker.score(np.array(match_idx), query_chunk_meta, match_chunk_meta)
+        # check the matched docs are in descending order of the scores
+        # check the matched docs are in descending order of the scores
+        self.assertGreater(doc_idx[0][1], doc_idx[1][1])
+        self.assertEqual(doc_idx[0][0], 1)
+        self.assertEqual(doc_idx[1][0], 4294967294)
+        # check the number of matched docs
+        self.assertEqual(len(doc_idx), 2)
+import unittest
+
+from jina.executors.rankers.tfidf import TfIdfRanker
+from tests.executors.rankers import RankerTestCase
+
+
+class MyTestCase(RankerTestCase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ranker = TfIdfRanker(threshold=0.2)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import unittest
+import os
+import numpy as np
+
+from jina.executors.encoders.clients import UnaryTFServingClientEncoder
+from jina.executors import BaseExecutor
+from tests import JinaTestCase
+
+
+class MnistTFServingClientEncoder(UnaryTFServingClientEncoder):
+    def __init__(self, *args, **kwargs):
+        default_kwargs = dict(
+            host='0.0.0.0', port='8500', method_name='Predict', signature_name='predict_images',
+            input_name='images', output_name='scores', model_name='mnist')
+        kwargs.update(default_kwargs)
+        super().__init__(*args, **kwargs)
+
+
+@unittest.skip('add grpc mocking for this test')
+class MyTestCase(JinaTestCase):
+    @property
+    def workspace(self):
+        return os.path.join(os.environ['TEST_WORKDIR'], 'test_tmp')
+
+    def get_encoder(self):
+        encoder = MnistTFServingClientEncoder()
+        encoder.workspace = self.workspace
+        self.add_tmpfile(encoder.workspace)
+        return encoder
+
+    def test_mnist_encoding(self):
+        encoder = self.get_encoder()
+        data = np.random.rand(1, 784)
+        result = encoder.encode(data)
+        self.assertEqual(result.shape, (10, ))
+
+    def test_save_and_load(self):
+        encoder = self.get_encoder()
+        data = np.random.rand(1, 784)
+        encoded_data_control = encoder.encode(data)
+        encoder.touch()
+        encoder.save()
+        self.assertTrue(os.path.exists(encoder.save_abspath))
+        encoder_loaded = BaseExecutor.load(encoder.save_abspath)
+        encoded_data_test = encoder_loaded.encode(data)
+        np.testing.assert_array_equal(encoded_data_control, encoded_data_test)
+
+    def test_save_and_load_config(self):
+        encoder = self.get_encoder()
+        encoder.save_config()
+        self.assertTrue(os.path.exists(encoder.config_abspath))
+        encoder_loaded = BaseExecutor.load_config(encoder.config_abspath)
+        self.assertEqual(encoder_loaded.model_name, encoder.model_name)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import unittest
+
+from jina.executors.encoders.nlp.flair import FlairTextEncoder
+from tests.executors.encoders.nlp import NlpTestCase
+
+
+class MyTestCase(NlpTestCase):
+    def _get_encoder(self, metas):
+        return FlairTextEncoder(embeddings=('word:glove',), pooling_strategy='mean', metas=metas)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import os
+import unittest
+
+import numpy as np
+
+from jina.executors import BaseExecutor
+from jina.executors.encoders.nlp.char import OneHotTextEncoder
+from tests import JinaTestCase
+
+
+class MyTestCase(JinaTestCase):
+    def test_encoding_results(self):
+        encoder = OneHotTextEncoder(workspace=os.environ['TEST_WORKDIR'])
+        test_data = np.array(['a', 'b', 'c', 'x', '!'])
+        encoded_data = encoder.encode(test_data)
+        self.assertEqual(encoded_data.shape, (5, 97))
+        self.assertIs(type(encoded_data), np.ndarray)
+
+    def test_save_and_load(self):
+        encoder = OneHotTextEncoder(workspace=os.environ['TEST_WORKDIR'])
+        encoder.save_config()
+        self.assertTrue(os.path.exists(encoder.config_abspath))
+        test_data = np.array(['a', 'b', 'c', 'x', '!'])
+        encoded_data_control = encoder.encode(test_data)
+
+        encoder.touch()
+        encoder.save()
+        self.assertTrue(os.path.exists(encoder.save_abspath))
+        encoder_loaded = BaseExecutor.load(encoder.save_abspath)
+        encoded_data_test = encoder_loaded.encode(test_data)
+
+        np.testing.assert_array_equal(encoded_data_control, encoded_data_test)
+        self.assertEqual(encoder_loaded.dim, encoder.dim)
+
+        self.add_tmpfile(
+            encoder.config_abspath, encoder.save_abspath, encoder_loaded.config_abspath, encoder_loaded.save_abspath)
+
+    def test_save_and_load_config(self):
+        encoder = OneHotTextEncoder(workspace=os.environ['TEST_WORKDIR'])
+        encoder.save_config()
+        self.assertTrue(os.path.exists(encoder.config_abspath))
+
+        encoder_loaded = BaseExecutor.load_config(encoder.config_abspath)
+        self.assertEqual(encoder_loaded.dim, encoder.dim)
+
+        self.add_tmpfile(encoder_loaded.config_abspath, encoder_loaded.save_abspath)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import unittest
+
+from jina.executors.encoders.nlp.transformer import TransformerTFEncoder, TransformerTorchEncoder
+from tests.executors.encoders.nlp import NlpTestCase
+
+
+class PytorchTestCase(NlpTestCase):
+    def _get_encoder(self, metas):
+        return TransformerTorchEncoder(
+            model_name='bert-base-uncased',
+            pooling_strategy='cls',
+            metas=metas)
+
+
+class TfTestCase(NlpTestCase):
+    def _get_encoder(self, metas):
+        return TransformerTFEncoder(
+            model_name='bert-base-uncased',
+            pooling_strategy='cls',
+            metas=metas)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import unittest
+
+from jina.executors.encoders.nlp.farm import FarmTextEncoder
+from tests.executors.encoders.nlp import NlpTestCase
+
+
+class MyTestCase(NlpTestCase):
+    def _get_encoder(self, metas):
+        return FarmTextEncoder(metas=metas)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import os
+import unittest
+
+import numpy as np
+
+from jina.executors import BaseExecutor
+from tests.executors import ExecutorTestCase
+
+
+class NlpTestCase(ExecutorTestCase):
+    @property
+    def workspace(self):
+        return os.path.join(os.environ['TEST_WORKDIR'], 'test_tmp')
+
+    @property
+    def target_output_dim(self):
+        return self._target_output_dim
+
+    @target_output_dim.setter
+    def target_output_dim(self, output_dim):
+        self._target_output_dim = output_dim
+
+    @property
+    def input_dim(self):
+        return self._input_dim
+
+    @input_dim.setter
+    def input_dim(self, input_dim):
+        self._input_dim = input_dim
+
+    def get_encoder(self):
+        encoder = self._get_encoder(self.metas)
+        if encoder is not None:
+            encoder.workspace = self.workspace
+            self.add_tmpfile(encoder.workspace)
+        return encoder
+
+    def _get_encoder(self, metas):
+        return None
+
+    @unittest.skipUnless('JINA_TEST_PRETRAINED' in os.environ, 'skip the pretrained test if not set')
+    def test_encoding_results(self):
+        encoder = self.get_encoder()
+        if encoder is None:
+            return
+        test_data = np.array(['it is a good day!', 'the dog sits on the floor.'])
+        encoded_data = encoder.encode(test_data)
+        self.assertEqual(encoded_data.shape[0], 2)
+
+    @unittest.skipUnless('JINA_TEST_PRETRAINED' in os.environ, 'skip the pretrained test if not set')
+    def test_save_and_load(self):
+        encoder = self.get_encoder()
+        if encoder is None:
+            return
+        test_data = np.array(['it is a good day!', 'the dog sits on the floor.'])
+        encoded_data_control = encoder.encode(test_data)
+        encoder.touch()
+        encoder.save()
+        self.assertTrue(os.path.exists(encoder.save_abspath))
+        encoder_loaded = BaseExecutor.load(encoder.save_abspath)
+        encoded_data_test = encoder_loaded.encode(test_data)
+        self.assertEqual(encoder_loaded.max_length, encoder.max_length)
+        np.testing.assert_array_equal(encoded_data_control, encoded_data_test)
+
+    @unittest.skipUnless('JINA_TEST_PRETRAINED' in os.environ, 'skip the pretrained test if not set')
+    def test_save_and_load_config(self):
+        encoder = self.get_encoder()
+        if encoder is None:
+            return
+        encoder.save_config()
+        self.assertTrue(os.path.exists(encoder.config_abspath))
+        encoder_loaded = BaseExecutor.load_config(encoder.config_abspath)
+        self.assertEqual(encoder_loaded.max_length, encoder.max_length)
+import os
+import unittest
+
+from jina.executors.encoders.nlp.paddlehub import TextPaddlehubEncoder
+from tests.executors.encoders.nlp import NlpTestCase
+
+
+class MyTestCase(NlpTestCase):
+    def _get_encoder(self, metas):
+        return TextPaddlehubEncoder(
+            max_length=10, workspace=os.environ['TEST_WORKDIR'], metas=metas)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import unittest
+
+import numpy as np
+
+from jina.executors.encoders.numeric.pca import IncrementalPCAEncoder
+from tests.executors.encoders.numeric import NumericTestCase
+
+
+class MyTestCase(NumericTestCase):
+    def _get_encoder(self):
+        self.input_dim = 28
+        self.target_output_dim = 2
+        encoder = IncrementalPCAEncoder(
+            output_dim=self.target_output_dim, whiten=True, num_features=self.input_dim)
+        train_data = np.random.rand(1000, self.input_dim)
+        encoder.train(train_data)
+        return encoder
+
+
+if __name__ == '__main__':
+    unittest.main()
+import os
+
+import numpy as np
+
+from jina.executors import BaseExecutor
+from tests import JinaTestCase
+
+
+class NumericTestCase(JinaTestCase):
+    @property
+    def workspace(self):
+        return os.path.join(os.environ['TEST_WORKDIR'], 'test_tmp')
+
+    @property
+    def target_output_dim(self):
+        return self._target_output_dim
+
+    @target_output_dim.setter
+    def target_output_dim(self, output_dim):
+        self._target_output_dim = output_dim
+
+    @property
+    def input_dim(self):
+        return self._input_dim
+
+    @input_dim.setter
+    def input_dim(self, input_dim):
+        self._input_dim = input_dim
+
+    def get_encoder(self):
+        encoder = self._get_encoder()
+        if encoder is not None:
+            encoder.workspace = self.workspace
+            self.add_tmpfile(encoder.workspace)
+        return encoder
+
+    def _get_encoder(self):
+        return None
+
+    def test_encoding_results(self):
+        encoder = self.get_encoder()
+        if encoder is None:
+            return
+        test_data = np.random.rand(10, self.input_dim)
+        encoded_data = encoder.encode(test_data)
+        self.assertEqual(encoded_data.shape, (test_data.shape[0], self.target_output_dim))
+        self.assertIs(type(encoded_data), np.ndarray)
+
+    def test_save_and_load(self):
+        encoder = self.get_encoder()
+        if encoder is None:
+            return
+        test_data = np.random.rand(10, self.input_dim)
+        encoded_data_control = encoder.encode(test_data)
+        encoder.touch()
+        encoder.save()
+        self.assertTrue(os.path.exists(encoder.save_abspath))
+        encoder_loaded = BaseExecutor.load(encoder.save_abspath)
+        encoded_data_test = encoder_loaded.encode(test_data)
+        np.testing.assert_array_equal(
+            encoded_data_test, encoded_data_control)
+
+    def test_save_and_load_config(self):
+        encoder = self.get_encoder()
+        if encoder is None:
+            return
+        encoder.save_config()
+        self.assertTrue(os.path.exists(encoder.config_abspath))
+        encoder_loaded = BaseExecutor.load_config(encoder.config_abspath)
+        self.assertEqual(encoder_loaded.output_dim, encoder.output_dim)
+import unittest
+
+from jina.executors.encoders.image.torchvision import ImageTorchEncoder
+from tests.executors.encoders.image import ImageTestCase
+
+
+class MyTestCase(ImageTestCase):
+    def _get_encoder(self, metas):
+        self.target_output_dim = 1280
+        self.input_dim = 224
+        return ImageTorchEncoder(metas=metas)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import unittest
+
+from jina.executors.encoders.image.bigtransfer import BiTImageEncoder
+from tests.executors.encoders.image import ImageTestCase
+
+
+class MyTestCase(ImageTestCase):
+    def _get_encoder(self, metas):
+        self.target_output_dim = 8192
+        self.input_dim = 48
+        return BiTImageEncoder(
+            model_path='/tmp/bit_models/Imagenet21k/R152x4/feature_vectors', channel_axis=1, metas=metas)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import unittest
+
+from jina.executors.encoders.image.customtorchvision import CustomImageTorchEncoder
+from tests.executors.encoders.image import ImageTestCase
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import tempfile
+
+
+class TestNet(nn.Module):
+    def __init__(self):
+        super(TestNet, self).__init__()
+        self.conv1 = nn.Conv2d(3, 10, 5)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(10, 16, 5)
+        self.fc1 = nn.Linear(16 * 53 * 53, 120)
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84, 10)
+
+    def forward(self, x):
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = x.view(-1, 16 * 53 * 53)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+
+class MyTestCase(ImageTestCase):
+    def _get_encoder(self, metas):
+        path = tempfile.NamedTemporaryFile().name
+        self.add_tmpfile(path)
+        model = TestNet()
+        torch.save(model, path)
+        self.target_output_dim = 10
+        self.input_dim = 224
+        return CustomImageTorchEncoder(model_path=path, layer_name='conv1', metas=metas)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import unittest
+
+from jina.executors.encoders.image.tfkeras import KerasImageEncoder
+from tests.executors.encoders.image import ImageTestCase
+
+
+class MyTestCase(ImageTestCase):
+    def _get_encoder(self, metas):
+        self.target_output_dim = 1280
+        self.input_dim = 96
+        return KerasImageEncoder(channel_axis=1, metas=metas)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import unittest
+
+from jina.executors.encoders.image.onnx import OnnxImageEncoder
+from tests.executors.encoders.image import ImageTestCase
+
+
+class MyTestCase(ImageTestCase):
+    def _get_encoder(self, metas):
+        self.target_output_dim = 1280
+        self.input_dim = 224
+        return OnnxImageEncoder(
+            output_feature='mobilenetv20_features_relu1_fwd',
+            model_path='/tmp/onnx/mobilenetv2-1.0/mobilenetv2-1.0.onnx',
+            metas=metas)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import os
+import unittest
+
+import numpy as np
+
+from jina.executors import BaseExecutor
+from tests.executors import ExecutorTestCase
+
+
+class ImageTestCase(ExecutorTestCase):
+    @property
+    def workspace(self):
+        return os.path.join(os.environ['TEST_WORKDIR'], 'test_tmp')
+
+    @property
+    def target_output_dim(self):
+        return self._target_output_dim
+
+    @target_output_dim.setter
+    def target_output_dim(self, output_dim):
+        self._target_output_dim = output_dim
+
+    @property
+    def input_dim(self):
+        return self._input_dim
+
+    @input_dim.setter
+    def input_dim(self, input_dim):
+        self._input_dim = input_dim
+
+    def get_encoder(self):
+        encoder = self._get_encoder(self.metas)
+        if encoder is not None:
+            encoder.workspace = self.workspace
+            self.add_tmpfile(encoder.workspace)
+        return encoder
+
+    def _get_encoder(self, metas):
+        return None
+
+    @unittest.skipUnless('JINA_TEST_PRETRAINED' in os.environ, 'skip the pretrained test if not set')
+    def test_encoding_results(self):
+        encoder = self.get_encoder()
+        if encoder is None:
+            return
+        test_data = np.random.rand(2, 3, self.input_dim, self.input_dim)
+        encoded_data = encoder.encode(test_data)
+        self.assertEqual(encoded_data.shape, (2, self.target_output_dim))
+
+    @unittest.skipUnless('JINA_TEST_PRETRAINED' in os.environ, 'skip the pretrained test if not set')
+    def test_save_and_load(self):
+        encoder = self.get_encoder()
+        if encoder is None:
+            return
+        test_data = np.random.rand(2, 3, self.input_dim, self.input_dim)
+        encoded_data_control = encoder.encode(test_data)
+        encoder.touch()
+        encoder.save()
+        self.assertTrue(os.path.exists(encoder.save_abspath))
+        encoder_loaded = BaseExecutor.load(encoder.save_abspath)
+        encoded_data_test = encoder_loaded.encode(test_data)
+        self.assertEqual(encoder_loaded.channel_axis, encoder.channel_axis)
+        np.testing.assert_array_equal(encoded_data_control, encoded_data_test)
+
+    @unittest.skipUnless('JINA_TEST_PRETRAINED' in os.environ, 'skip the pretrained test if not set')
+    def test_save_and_load_config(self):
+        encoder = self.get_encoder()
+        if encoder is None:
+            return
+        encoder.save_config()
+        self.assertTrue(os.path.exists(encoder.config_abspath))
+        encoder_loaded = BaseExecutor.load_config(encoder.config_abspath)
+        self.assertEqual(encoder_loaded.channel_axis, encoder.channel_axis)
+import unittest
+
+from jina.executors.encoders.image.paddlehub import ImagePaddlehubEncoder
+from tests.executors.encoders.image import ImageTestCase
+
+
+class MyTestCase(ImageTestCase):
+    def _get_encoder(self, metas):
+        self.target_output_dim = 2048
+        self.input_dim = 224
+        return ImagePaddlehubEncoder(metas=metas)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import unittest
+
+from jina.executors.encoders.video.torchvision import VideoTorchEncoder
+from tests.executors.encoders.video import VideoTestCase
+
+
+class MyTestCase(VideoTestCase):
+    def _get_encoder(self, metas):
+        self.target_output_dim = 512
+        self.input_dim = 112
+        return VideoTorchEncoder(metas=metas)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import os
+import unittest
+
+import numpy as np
+
+from jina.executors import BaseExecutor
+from tests.executors import ExecutorTestCase
+
+
+class VideoTestCase(ExecutorTestCase):
+    @property
+    def workspace(self):
+        return os.path.join(os.environ['TEST_WORKDIR'], 'test_tmp')
+
+    @property
+    def target_output_dim(self):
+        return self._target_output_dim
+
+    @target_output_dim.setter
+    def target_output_dim(self, output_dim):
+        self._target_output_dim = output_dim
+
+    def get_encoder(self):
+        encoder = self._get_encoder(self.metas)
+        if encoder is not None:
+            encoder.workspace = self.workspace
+            self.add_tmpfile(encoder.workspace)
+        return encoder
+
+    def _get_encoder(self, metas):
+        return None
+
+    @unittest.skipUnless('JINA_TEST_PRETRAINED' in os.environ, 'skip the pretrained test if not set')
+    def test_encoding_results(self):
+        encoder = self.get_encoder()
+        if encoder is None:
+            return
+        test_data = np.random.rand(2, 3, 3, 224, 224)
+        encoded_data = encoder.encode(test_data)
+        self.assertEqual(encoded_data.shape, (2, self._target_output_dim))
+
+    @unittest.skipUnless('JINA_TEST_PRETRAINED' in os.environ, 'skip the pretrained test if not set')
+    def test_save_and_load(self):
+        encoder = self.get_encoder()
+        if encoder is None:
+            return
+        test_data = np.random.rand(2, 3, 3, 224, 224)
+        encoded_data_control = encoder.encode(test_data)
+        encoder.touch()
+        encoder.save()
+        self.assertTrue(os.path.exists(encoder.save_abspath))
+        encoder_loaded = BaseExecutor.load(encoder.save_abspath)
+        encoded_data_test = encoder_loaded.encode(test_data)
+        self.assertEqual(encoder_loaded.model_name, encoder.model_name)
+        np.testing.assert_array_equal(encoded_data_control, encoded_data_test)
+
+    @unittest.skipUnless('JINA_TEST_PRETRAINED' in os.environ, 'skip the pretrained test if not set')
+    def test_save_and_load_config(self):
+        encoder = self.get_encoder()
+        if encoder is None:
+            return
+        encoder.save_config()
+        self.assertTrue(os.path.exists(encoder.config_abspath))
+        encoder_loaded = BaseExecutor.load_config(encoder.config_abspath)
+        self.assertEqual(encoder_loaded.model_name, encoder.model_name)
+import unittest
+
+from jina.executors.encoders.video.paddlehub import VideoPaddlehubEncoder
+from tests.executors.encoders.video import VideoTestCase
+
+
+class MyTestCase(VideoTestCase):
+    def _get_encoder(self, metas):
+        self.target_output_dim = 2048
+        self.input_dim = 224
+        return VideoPaddlehubEncoder(metas=metas)
+
+
+if __name__ == '__main__':
+    unittest.main()
+from jina.enums import ClientInputType
+from jina.executors.crafters import BaseSegmenter
+from jina.flow import Flow
+from jina.proto import jina_pb2
+from tests import JinaTestCase
+
+
+def random_docs(num_docs):
+    for j in range(num_docs):
+        yield jina_pb2.Document()
+
+
+class DummySegment(BaseSegmenter):
+    def craft(self):
