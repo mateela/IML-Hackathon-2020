@@ -1,0 +1,3010 @@
+        return [dict(buffer=b'aa'), dict(buffer=b'bb')]
+
+
+class MyTestCase(JinaTestCase):
+    def get_chunk_id(self, req):
+        id = 0
+        for d in req.index.docs:
+            for c in d.chunks:
+                self.assertEqual(c.chunk_id, id)
+                id += 1
+
+    def collect_chunk_id(self, req):
+        chunk_ids = [c.chunk_id for d in req.index.docs for c in d.chunks]
+        self.assertTrue(len(chunk_ids), len(set(chunk_ids)))
+
+    def test_dummy_seg(self):
+        f = Flow().add(yaml_path='DummySegment')
+        with f:
+            f.index(input_fn=random_docs(10), input_type=ClientInputType.PROTOBUF, output_fn=self.get_chunk_id)
+
+    def test_dummy_seg_random(self):
+        f = Flow().add(yaml_path='../../yaml/dummy-seg-random.yml')
+        with f:
+            f.index(input_fn=random_docs(10), input_type=ClientInputType.PROTOBUF, output_fn=self.collect_chunk_id)
+import glob
+
+from jina.enums import ClientInputType
+from jina.flow import Flow
+from tests import JinaTestCase
+
+num_docs = 100
+
+
+def input_fn(pattern='../../../**/*.png'):
+    idx = 0
+    for g in glob.glob(pattern, recursive=True)[:num_docs]:
+        with open(g, 'rb') as fp:
+            yield fp.read()
+            idx += 1
+
+
+def input_fn2(pattern='../../*.*'):
+    for g in glob.glob(pattern, recursive=True)[:num_docs]:
+        yield g
+
+
+class MyTestCase(JinaTestCase):
+    def test_dummy_seg(self):
+        f = Flow().add(yaml_path='!Buffer2DataURI\nwith: {mimetype: png}')
+        with f:
+            f.index(input_fn=input_fn(), output_fn=print)
+
+        f = Flow().add(yaml_path='!Buffer2DataURI\nwith: {mimetype: png, base64: true}')
+        with f:
+            f.index(input_fn=input_fn(), output_fn=print)
+
+    def test_any_file(self):
+        f = Flow().add(yaml_path='!FilePath2DataURI\nwith: {base64: true}')
+        with f:
+            f.index(input_fn=input_fn2, output_fn=print, input_type=ClientInputType.FILE_PATH)
+
+    def test_aba(self):
+        f = (Flow().add(yaml_path='!Buffer2DataURI\nwith: {mimetype: png}')
+             .add(yaml_path='DataURI2Buffer')
+             .add(yaml_path='!Buffer2DataURI\nwith: {mimetype: png}'))
+
+        with f:
+            f.index(input_fn=input_fn, output_fn=print)
+
+    # def test_dummy_seg_random(self):
+    #     f = Flow().add(yaml_path='../../yaml/dummy-seg-random.yml')
+    #     with f:
+    #         f.index(input_fn=random_docs(10), input_type=ClientInputType.PROTOBUF, output_fn=self.collect_chunk_id)
+import unittest
+
+from jina.executors.crafters.nlp.split import Sentencizer, JiebaSegmenter
+from tests import JinaTestCase
+
+
+class MyTestCase(JinaTestCase):
+    def test_sentencier_en(self):
+        sentencizer = Sentencizer()
+        buffer = b'It is a sunny day!!!! When Andy comes back, we are going to the zoo.'
+        crafted_chunk_list = sentencizer.craft(buffer, 0)
+        self.assertEqual(len(crafted_chunk_list), 2)
+
+    def test_sentencier_en_new_lines(self):
+        """
+        New lines are also considered as a separator.
+        """
+        sentencizer = Sentencizer()
+        buffer = b'It is a sunny day!!!! When Andy comes back,\n' \
+                 b'we are going to the zoo.'
+        crafted_chunk_list = sentencizer.craft(buffer, 0)
+        self.assertEqual(len(crafted_chunk_list), 3)
+
+    def test_sentencier_en_float_numbers(self):
+        """
+        Separators in float numbers, URLs, emails, abbreviations (like 'Mr.')
+        are not taking into account.
+        """
+        sentencizer = Sentencizer()
+        buffer = b'With a 0.99 probability this sentence will be ' \
+                 b'tokenized in 2 sentences.'
+        crafted_chunk_list = sentencizer.craft(buffer, 0)
+        self.assertEqual(len(crafted_chunk_list), 2)
+
+    def test_sentencier_en_trim_spaces(self):
+        """
+        Trimming all spaces at the beginning an end of the chunks.
+        Keeping extra spaces inside chunks.
+        Ignoring chunks with only spaces.
+        """
+        sentencizer = Sentencizer()
+        buffer = b'  This ,  text is...  . Amazing !!'
+        chunks = [i["text"] for i in sentencizer.craft(buffer, 0)]
+        self.assertListEqual(chunks, ["This ,  text is", "Amazing"])
+
+    def test_sentencier_cn(self):
+        sentencizer = Sentencizer()
+        buffer = '今天是个大晴天！安迪回来以后，我们准备去动物园。'.encode('utf8')
+        crafted_chunk_list = sentencizer.craft(buffer, 0)
+        self.assertEqual(len(crafted_chunk_list), 2)
+
+    def test_jieba_crafter(self):
+        jieba_crafter = JiebaSegmenter(mode='accurate')
+        buffer = '今天是个大晴天！安迪回来以后，我们准备去动物园。'.encode('utf-8')
+        crafted_chunk_list = jieba_crafter.craft(buffer, 0)
+        self.assertEqual(len(crafted_chunk_list), 14)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import unittest
+import numpy as np
+
+from jina.executors.crafters.numeric.io import ArrayReader
+from tests import JinaTestCase
+
+
+class MyTestCase(JinaTestCase):
+    def test_array_reader(self):
+        size = 8
+        sample_array = np.random.rand(size).astype('float32')
+        buffer = ','.join([str(x) for x in sample_array]).encode('utf8')
+
+        reader = ArrayReader()
+        crafted_chunk = reader.craft(buffer, 0)
+
+        np.testing.assert_array_equal(crafted_chunk['blob'], sample_array)
+
+if __name__ == '__main__':
+    unittest.main()
+import os
+import unittest
+
+from jina.executors.crafters.image.io import ImageReader
+from tests.executors.crafters.image import JinaImageTestCase
+
+
+class MyTestCase(JinaImageTestCase):
+    def test_io(self):
+        crafter = ImageReader()
+        tmp_fn = os.path.join(crafter.current_workspace, "test.jpeg")
+        img_size = 50
+        self.create_test_image(tmp_fn, size=img_size)
+        test_chunk, *_ = crafter.craft(tmp_fn.encode("utf8"), doc_id=0)
+        self.assertEqual(test_chunk["blob"].shape, (img_size, img_size, 3))
+        self.add_tmpfile(tmp_fn)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import unittest
+
+import numpy as np
+
+from jina.executors.crafters.image.crop import ImageCropper, CenterImageCropper, RandomImageCropper, FiveImageCropper, \
+    SlidingWindowImageCropper
+from tests.executors.crafters.image import JinaImageTestCase
+
+
+class MyTestCase(JinaImageTestCase):
+    def test_crop(self):
+        img_size = 217
+        img_array = self.create_random_img_array(img_size, img_size)
+        left = 2
+        top = 17
+        width = 20
+        height = 20
+        crafter = ImageCropper(left, top, width, height)
+        crafted_chunk = crafter.craft(img_array, 0, 0)
+        np.testing.assert_array_equal(
+            crafted_chunk['blob'], np.asarray(img_array[top:top + height, left:left + width, :]),
+            'img_array: {}\ntest: {}\ncontrol:{}'.format(
+                img_array.shape,
+                crafted_chunk['blob'].shape,
+                np.asarray(img_array[left:left + width, top:top + height, :]).shape))
+
+    def test_center_crop(self):
+        img_size = 217
+        img_array = self.create_random_img_array(img_size, img_size)
+        output_dim = 20
+        crafter = CenterImageCropper(output_dim)
+        crafted_chunk = crafter.craft(img_array, 0, 0)
+        self.assertEqual(crafted_chunk["blob"].shape, (20, 20, 3))
+
+    def test_random_crop(self):
+        img_size = 217
+        img_array = self.create_random_img_array(img_size, img_size)
+        output_dim = 20
+        num_pathes = 20
+        crafter = RandomImageCropper(output_dim, num_pathes)
+        crafted_chunk_list = crafter.craft(img_array, 0, 0)
+        self.assertEqual(len(crafted_chunk_list), num_pathes)
+
+    def test_random_crop(self):
+        img_size = 217
+        img_array = self.create_random_img_array(img_size, img_size)
+        output_dim = 20
+        crafter = FiveImageCropper(output_dim)
+        crafted_chunk_list = crafter.craft(img_array, 0, 0)
+        self.assertEqual(len(crafted_chunk_list), 5)
+
+    def test_sliding_windows(self):
+        img_size = 14
+        img_array = self.create_random_img_array(img_size, img_size)
+        output_dim = 4
+        strides = (6, 6)
+        crafter = SlidingWindowImageCropper(output_dim, strides, 'VALID')
+        crafted_chunk_list = crafter.craft(img_array, 0, 0)
+        self.assertEqual(len(crafted_chunk_list), 4)
+
+        crafter = SlidingWindowImageCropper(output_dim, strides, 'SAME')
+        crafted_chunk_list = crafter.craft(img_array, 0, 0)
+        self.assertEqual(len(crafted_chunk_list), 9)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import unittest
+
+from jina.executors.crafters.image.normalize import ImageNormalizer
+from tests.executors.crafters.image import JinaImageTestCase
+
+
+class MyTestCase(JinaImageTestCase):
+    def test_transform_results(self):
+        img_size = 217
+        target_size = 224
+        crafter = ImageNormalizer(target_size=target_size)
+        img_array = self.create_random_img_array(img_size, img_size)
+        crafted_chunk = crafter.craft(img_array, chunk_id=0, doc_id=0)
+        self.assertEqual(crafted_chunk["blob"].shape, (224, 224, 3))
+
+
+if __name__ == '__main__':
+    unittest.main()
+from tests import JinaTestCase
+
+
+class JinaImageTestCase(JinaTestCase):
+    @staticmethod
+    def create_test_image(output_fn, size=50):
+        from PIL import Image
+        image = Image.new('RGB', size=(size, size), color=(155, 0, 0))
+        with open(output_fn, "wb") as f:
+            image.save(f, 'jpeg')
+
+    @staticmethod
+    def create_random_img_array(img_height, img_width):
+        import numpy as np
+        return np.random.randint(0, 256, (img_height, img_width, 3))
+
+    @staticmethod
+    def create_test_img_array():
+        import numpy as np
+        img = np.array([i for i in range(100)]).reshape(10, 10)
+        return np.repeat(img[:, :, np.newaxis], 3, axis=2)
+import unittest
+
+from jina.executors.crafters.image.resize import ImageResizer
+from tests.executors.crafters.image import JinaImageTestCase
+
+
+class MyTestCase(JinaImageTestCase):
+    def test_resize(self):
+        img_width = 20
+        img_height = 17
+        output_dim = 71
+        crafter = ImageResizer(target_size=output_dim)
+        img_array = self.create_random_img_array(img_width, img_height)
+        crafted_chunk = crafter.craft(img_array, chunk_id=0, doc_id=0)
+        self.assertEqual(min(crafted_chunk['blob'].shape[:-1]), output_dim)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import os
+import unittest
+
+import numpy as np
+
+from jina.executors.indexers import BaseIndexer
+from jina.executors.indexers.vector.annoy import AnnoyIndexer
+from jina.executors.indexers.vector.nmslib import NmslibIndexer
+from jina.executors.indexers.vector.numpy import NumpyIndexer
+from tests import JinaTestCase
+
+# fix the seed here
+np.random.seed(500)
+retr_idx = None
+vec_idx = np.random.randint(0, high=100, size=[1, 10])
+vec = np.random.random([10, 10])
+query = np.array(np.random.random([10, 10]), dtype=np.float32)
+
+
+class MyTestCase(JinaTestCase):
+
+    def test_simple_annoy(self):
+        from annoy import AnnoyIndex
+        _index = AnnoyIndex(5, 'angular')
+        for j in range(3):
+            _index.add_item(j, np.random.random((5,)))
+        _index.build(4)
+        idx1, _ = _index.get_nns_by_vector(np.random.random((5,)), 3, include_distances=True)
+
+    def test_np_indexer(self):
+        a = NumpyIndexer(index_filename='np.test.gz')
+        a.add(vec_idx, vec)
+        a.save()
+        a.close()
+        self.assertTrue(os.path.exists(a.index_abspath))
+        # a.query(np.array(np.random.random([10, 5]), dtype=np.float32), top_k=4)
+
+        b = BaseIndexer.load(a.save_abspath)
+        idx, dist = b.query(query, top_k=4)
+        print(idx, dist)
+        global retr_idx
+        if retr_idx is None:
+            retr_idx = idx
+        else:
+            np.testing.assert_almost_equal(retr_idx, idx)
+        self.assertEqual(idx.shape, dist.shape)
+        self.assertEqual(idx.shape, (10, 4))
+        self.add_tmpfile(a.index_abspath, a.save_abspath)
+
+    def test_scipy_indexer(self):
+        a = NumpyIndexer(index_filename='np.test.gz', backend='scipy')
+        a.add(vec_idx, vec)
+        a.save()
+        a.close()
+        self.assertTrue(os.path.exists(a.index_abspath))
+        # a.query(np.array(np.random.random([10, 5]), dtype=np.float32), top_k=4)
+
+        b = BaseIndexer.load(a.save_abspath)
+        idx, dist = b.query(query, top_k=4)
+        print(idx, dist)
+        global retr_idx
+        if retr_idx is None:
+            retr_idx = idx
+        else:
+            np.testing.assert_almost_equal(retr_idx, idx)
+        self.assertEqual(idx.shape, dist.shape)
+        self.assertEqual(idx.shape, (10, 4))
+        self.add_tmpfile(a.index_abspath, a.save_abspath)
+
+    def test_nmslib_indexer(self):
+        a = NmslibIndexer(index_filename='np.test.gz', space='l2')
+        a.add(vec_idx, vec)
+        a.save()
+        a.close()
+        self.assertTrue(os.path.exists(a.index_abspath))
+        # a.query(np.array(np.random.random([10, 5]), dtype=np.float32), top_k=4)
+
+        b = BaseIndexer.load(a.save_abspath)
+        idx, dist = b.query(query, top_k=4)
+        print(idx, dist)
+        global retr_idx
+        if retr_idx is None:
+            retr_idx = idx
+        else:
+            np.testing.assert_almost_equal(retr_idx, idx)
+        self.assertEqual(idx.shape, dist.shape)
+        self.assertEqual(idx.shape, (10, 4))
+        self.add_tmpfile(a.index_abspath, a.save_abspath)
+
+    def test_annoy_indexer(self):
+        a = AnnoyIndexer(index_filename='annoy.test.gz')
+        a.add(vec_idx, vec)
+        a.save()
+        a.close()
+        self.assertTrue(os.path.exists(a.index_abspath))
+        # a.query(np.array(np.random.random([10, 5]), dtype=np.float32), top_k=4)
+
+        b = BaseIndexer.load(a.save_abspath)
+        idx, dist = b.query(query, top_k=4)
+        print(idx, dist)
+        global retr_idx
+        if retr_idx is None:
+            retr_idx = idx
+        else:
+            np.testing.assert_almost_equal(retr_idx, idx)
+        self.assertEqual(idx.shape, dist.shape)
+        self.assertEqual(idx.shape, (10, 4))
+        self.add_tmpfile(a.index_abspath, a.save_abspath)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import os
+import unittest
+
+from google.protobuf.json_format import MessageToJson
+
+import jina.proto.jina_pb2 as jina_pb2
+from jina.executors.indexers import BaseIndexer
+from jina.executors.indexers.keyvalue.leveldb import LeveldbIndexer
+from tests import JinaTestCase
+
+
+class MyTestCase(JinaTestCase):
+    def _create_Document(self, doc_id, text, weight, length):
+        d = jina_pb2.Document()
+        d.doc_id = doc_id
+        d.buffer = text.encode('utf8')
+        d.weight = weight
+        d.length = length
+        return d
+
+    def run_test(self, indexer):
+        data = {
+            'd1': MessageToJson(self._create_Document(1, 'cat', 0.1, 3)),
+            'd2': MessageToJson(self._create_Document(2, 'dog', 0.2, 3)),
+            'd3': MessageToJson(self._create_Document(3, 'bird', 0.3, 3)),
+        }
+        indexer.add(data)
+        indexer.save()
+        indexer.close()
+        self.assertTrue(os.path.exists(indexer.index_abspath))
+
+        searcher = BaseIndexer.load(indexer.save_abspath)
+        doc = searcher.query('d2')
+        self.assertEqual(doc.doc_id, 2)
+        self.assertEqual(doc.length, 3)
+        self.add_tmpfile(indexer.save_abspath, indexer.index_abspath)
+
+    def test_add_query(self):
+        indexer = LeveldbIndexer(index_filename='leveldb.db')
+        self.run_test(indexer)
+
+    def test_load_yaml(self):
+        from jina.executors import BaseExecutor
+        indexer = BaseExecutor.load_config('../../../yaml/test-leveldb.yml')
+        self.run_test(indexer)
+
+
+if __name__ == '__main__':
+    unittest.main()
+import os
+import time
+
+from jina.executors.crafters import BaseDocCrafter
+
+
+class SlowWorker(BaseDocCrafter):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # half of worker is slow
+        self.is_slow = os.getpid() % 10 != 0
+        self.logger.warning('im a slow worker')
+
+    def craft(self, doc_id, *args, **kwargs):
+        if self.is_slow:
+            self.logger.warning('slowly doing')
+            time.sleep(2)
+        return {'doc_id': doc_id}
+from jina.executors import BaseExecutor
+
+
+class DummyExternalIndexer(BaseExecutor):
+    pass
+import os
+import re
+import sys
+from os import path
+
+sys.path.insert(0, path.abspath('..'))
+
+project = 'Jina'
+slug = re.sub(r'\W+', '-', project.lower())
+author = 'Jina AI Dev Team'
+copyright = 'Jina AI Limited. All rights reserved.'
+source_suffix = ['.rst', '.md']
+master_doc = 'index'
+language = 'en'
+
+try:
+    if 'JINA_VERSION' not in os.environ:
+        pkg_name = 'jina'
+        libinfo_py = path.join('..', pkg_name, '__init__.py')
+        libinfo_content = open(libinfo_py, 'r').readlines()
+        version_line = [l.strip() for l in libinfo_content if l.startswith('__version__')][0]
+        exec(version_line)
+    else:
+        __version__ = os.environ['JINA_VERSION']
+except FileNotFoundError:
+    __version__ = '0.0.0'
+
+version = __version__
+release = __version__
+
+templates_path = ['template']
+exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store', 'tests']
+pygments_style = 'rainbow_dash'
+html_theme = 'sphinx_rtd_theme'
+html_theme_options = {
+    # 'canonical_url': '',
+    'analytics_id': 'UA-164627626-3',  #  Provided by Google in your dashboard
+    'logo_only': True,
+    'display_version': True,
+    # 'prev_next_buttons_location': 'bottom',
+    'style_external_links': True,
+    # 'vcs_pageview_mode': '',
+    # # 'style_nav_header_background': 'white',
+    # Toc options
+    'collapse_navigation': True,
+    # 'sticky_navigation': True,
+    # 'navigation_depth': 4,
+    'includehidden': True,
+    'titles_only': True,
+    'show_sphinx': False
+}
+
+html_static_path = ['_static']
+html_logo = '../.github/jina-prod-logo.svg'
+html_css_files = ['main.css']
+htmlhelp_basename = slug
+html_show_sourcelink = False
+
+
+latex_documents = [(master_doc, '{0}.tex'.format(slug), project, author, 'manual')]
+man_pages = [(master_doc, slug, project, [author], 1)]
+texinfo_documents = [(master_doc, slug, project, author, slug, project, 'Miscellaneous')]
+epub_title = project
+epub_exclude_files = ['search.html']
+
+# -- Extension configuration -------------------------------------------------
+
+extensions = [
+    'sphinx.ext.autodoc',
+    'sphinx_autodoc_typehints',
+    'sphinx.ext.viewcode',
+    'sphinxcontrib.apidoc',
+    'sphinxarg.ext',
+    'sphinx_rtd_theme',
+    'recommonmark',
+    'sphinx_markdown_tables',
+    'sphinx_copybutton'
+]
+
+apidoc_module_dir = '../jina/'
+apidoc_output_dir = 'api'
+apidoc_excluded_paths = ['tests', 'legacy']
+apidoc_separate_modules = True
+apidoc_extra_args = ['-t', 'template/']
+autodoc_member_order = 'bysource'
+autodoc_mock_imports = ['argparse', 'numpy', 'np']
+autoclass_content = 'both'
+set_type_checking_flag = False
+
+
+def setup(app):
+    from sphinx.domains.python import PyField
+    from sphinx.util.docfields import Field
+    from sphinx.locale import _
+
+    app.add_object_type(
+        'confval',
+        'confval',
+        objname='configuration value',
+        indextemplate='pair: %s; configuration value',
+        doc_field_types=[
+            PyField(
+                'type',
+                label=_('Type'),
+                has_arg=False,
+                names=('type',),
+                bodyrolename='class'
+            ),
+            Field(
+                'default',
+                label=_('Default'),
+                has_arg=False,
+                names=('default',),
+            ),
+        ]
+    )
+__copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
+__license__ = "Apache-2.0"
+
+import copy
+import os
+import tempfile
+import threading
+import time
+from collections import OrderedDict
+from contextlib import ExitStack
+from functools import wraps
+from typing import Union, Tuple, List, Set, Dict, Iterator, Callable, Type, TextIO, Any
+
+import ruamel.yaml
+from ruamel.yaml import StringIO
+
+from .. import JINA_GLOBAL
+from ..enums import FlowBuildLevel, FlowOptimizeLevel
+from ..excepts import FlowTopologyError, FlowMissingPodError, FlowBuildLevelError, FlowConnectivityError
+from ..helper import yaml, expand_env_var, get_non_defaults_args, deprecated_alias
+from ..logging import get_logger
+from ..logging.sse import start_sse_logger
+from ..peapods.pod import SocketType, FlowPod, GatewayFlowPod
+
+if False:
+    from ..proto import jina_pb2
+    import argparse
+
+
+def build_required(required_level: 'FlowBuildLevel'):
+    """Annotate a function so that it requires certaidn build level to run.
+
+    :param required_level: required build level to run this function.
+
+    Example:
+
+    .. highlight:: python
+    .. code-block:: python
+
+        @build_required(FlowBuildLevel.RUNTIME)
+        def foo():
+            print(1)
+
+    """
+
+    def __build_level(func):
+        @wraps(func)
+        def arg_wrapper(self, *args, **kwargs):
+            if hasattr(self, '_build_level'):
+                if self._build_level.value >= required_level.value:
+                    return func(self, *args, **kwargs)
+                else:
+                    raise FlowBuildLevelError(
+                        'build_level check failed for %r, required level: %s, actual level: %s' % (
+                            func, required_level, self._build_level))
+            else:
+                raise AttributeError('%r has no attribute "_build_level"' % self)
+
+        return arg_wrapper
+
+    return __build_level
+
+
+class Flow:
+    def __init__(self, args: 'argparse.Namespace' = None, **kwargs):
+        """Initialize a flow object
+
+        :param kwargs: other keyword arguments that will be shared by all pods in this flow
+
+
+        More explain on ``optimize_level``:
+
+        As an example, the following flow will generates a 6 Peas,
+
+        .. highlight:: python
+        .. code-block:: python
+
+            f = Flow(optimize_level=FlowOptimizeLevel.NONE).add(yaml_path='forward', replicas=3)
+
+        The optimized version, i.e. :code:`Flow(optimize_level=FlowOptimizeLevel.FULL)`
+        will generate 4 Peas, but it will force the :class:`GatewayPea` to take BIND role,
+        as the head and tail routers are removed.
+        """
+        self.logger = get_logger(self.__class__.__name__)
+        self._pod_nodes = OrderedDict()  # type: Dict[str, 'FlowPod']
+        self._build_level = FlowBuildLevel.EMPTY
+        self._pod_name_counter = 0
+        self._last_changed_pod = ['gateway']  #: default first pod is gateway, will add when build()
+
+        self._update_args(args, **kwargs)
+
+    def _update_args(self, args, **kwargs):
+        from ..main.parser import set_flow_parser
+        _flow_parser = set_flow_parser()
+        if args is None:
+            from ..helper import get_parsed_args
+            _, args, _ = get_parsed_args(kwargs, _flow_parser, 'Flow')
+
+        self.args = args
+        if kwargs and self.args.logserver and 'log_sse' not in kwargs:
+            kwargs['log_sse'] = True
+        self._common_kwargs = kwargs
+        self._kwargs = get_non_defaults_args(args, _flow_parser)  #: for yaml dump
+
+    @classmethod
+    def to_yaml(cls, representer, data):
+        """Required by :mod:`ruamel.yaml.constructor` """
+        tmp = data._dump_instance_to_yaml(data)
+        representer.sort_base_mapping_type_on_output = False
+        return representer.represent_mapping('!' + cls.__name__, tmp)
+
+    @staticmethod
+    def _dump_instance_to_yaml(data):
+        # note: we only save non-default property for the sake of clarity
+        r = {}
+
+        if data._kwargs:
+            r['with'] = data._kwargs
+
+        if data._pod_nodes:
+            r['pods'] = {}
+
+        if 'gateway' in data._pod_nodes:
+            # always dump gateway as the first pod, if exist
+            r['pods']['gateway'] = {}
+
+        for k, v in data._pod_nodes.items():
+            if k == 'gateway':
+                continue
+
+            kwargs = {'needs': list(v.needs)} if v.needs else {}
+            kwargs.update(v._kwargs)
+
+            if 'name' in kwargs:
+                kwargs.pop('name')
+
+            r['pods'][k] = kwargs
+        return r
+
+    @classmethod
+    def from_yaml(cls, constructor, node):
+        """Required by :mod:`ruamel.yaml.constructor` """
+        return cls._get_instance_from_yaml(constructor, node)[0]
+
+    def save_config(self, filename: str = None) -> bool:
+        """
+        Serialize the object to a yaml file
+
+        :param filename: file path of the yaml file, if not given then :attr:`config_abspath` is used
+        :return: successfully dumped or not
+        """
+        f = filename
+        if not f:
+            f = tempfile.NamedTemporaryFile('w', delete=False, dir=os.environ.get('JINA_EXECUTOR_WORKDIR', None)).name
+        yaml.register_class(Flow)
+        # yaml.sort_base_mapping_type_on_output = False
+        # yaml.representer.add_representer(OrderedDict, yaml.Representer.represent_dict)
+
+        with open(f, 'w', encoding='utf8') as fp:
+            yaml.dump(self, fp)
+        self.logger.info(f'{self}\'s yaml config is save to %s' % f)
+        return True
+
+    @property
+    def yaml_spec(self):
+        yaml.register_class(Flow)
+        stream = StringIO()
+        yaml.dump(self, stream)
+        return stream.getvalue().strip()
+
+    @classmethod
+    def load_config(cls: Type['Flow'], filename: Union[str, TextIO]) -> 'Flow':
+        """Build an executor from a YAML file.
+
+        :param filename: the file path of the YAML file or a ``TextIO`` stream to be loaded from
+        :return: an executor object
+        """
+        yaml.register_class(Flow)
+        if not filename: raise FileNotFoundError
+        if isinstance(filename, str):
+            # deserialize from the yaml
+            with open(filename, encoding='utf8') as fp:
+                return yaml.load(fp)
+        else:
+            with filename:
+                return yaml.load(filename)
+
+    @classmethod
+    def _get_instance_from_yaml(cls, constructor, node):
+
+        data = ruamel.yaml.constructor.SafeConstructor.construct_mapping(
+            constructor, node, deep=True)
+
+        p = data.get('with', {})  # type: Dict[str, Any]
+        a = p.pop('args') if 'args' in p else ()
+        k = p.pop('kwargs') if 'kwargs' in p else {}
+        # maybe there are some hanging kwargs in "parameters"
+        tmp_a = (expand_env_var(v) for v in a)
+        tmp_p = {kk: expand_env_var(vv) for kk, vv in {**k, **p}.items()}
+        obj = cls(*tmp_a, **tmp_p)
+
+        pp = data.get('pods', {})
+        for pod_name, pod_attr in pp.items():
+            p_pod_attr = {kk: expand_env_var(vv) for kk, vv in pod_attr.items()}
+            if pod_name != 'gateway':
+                # ignore gateway when reading, it will be added during build()
+                obj.add(name=pod_name, **p_pod_attr, copy_flow=False)
+
+        obj.logger.success(f'successfully built {cls.__name__} from a yaml config')
+
+        # if node.tag in {'!CompoundExecutor'}:
+        #     os.environ['JINA_WARN_UNNAMED'] = 'YES'
+
+        return obj, data
+
+    @staticmethod
+    def _parse_endpoints(op_flow, pod_name, endpoint, connect_to_last_pod=False) -> Set:
+        # parsing needs
+        if isinstance(endpoint, str):
+            endpoint = [endpoint]
+        elif not endpoint:
+            if op_flow._last_changed_pod and connect_to_last_pod:
+                endpoint = [op_flow._last_changed_pod[-1]]
+            else:
+                endpoint = []
+
+        if isinstance(endpoint, list) or isinstance(endpoint, tuple):
+            for idx, s in enumerate(endpoint):
+                if s == pod_name:
+                    raise FlowTopologyError('the income/output of a pod can not be itself')
+        else:
+            raise ValueError('endpoint=%s is not parsable' % endpoint)
+        return set(endpoint)
+
+    def set_last_pod(self, name: str, copy_flow: bool = True) -> 'Flow':
+        """
+        Set a pod as the last pod in the flow, useful when modifying the flow.
+
+        :param name: the name of the existing pod
+        :param copy_flow: when set to true, then always copy the current flow and do the modification on top of it then return, otherwise, do in-line modification
+        :return: a (new) flow object with modification
+        """
+        op_flow = copy.deepcopy(self) if copy_flow else self
+
+        if name not in op_flow._pod_nodes:
+            raise FlowMissingPodError('%s can not be found in this Flow' % name)
+
+        if op_flow._last_changed_pod and name == op_flow._last_changed_pod[-1]:
+            pass
+        else:
+            op_flow._last_changed_pod.append(name)
+
+        # graph is now changed so we need to
+        # reset the build level to the lowest
+        op_flow._build_level = FlowBuildLevel.EMPTY
+
+        return op_flow
+
+    def _add_gateway(self, needs, **kwargs):
+        pod_name = 'gateway'
+
+        kwargs.update(self._common_kwargs)
+        kwargs['name'] = 'gateway'
+        self._pod_nodes[pod_name] = GatewayFlowPod(kwargs, needs)
+
+        # self.set_last_pod(pod_name, False)
+
+    def join(self, needs: Union[Tuple[str], List[str]], *args, **kwargs) -> 'Flow':
+        """
+        Add a blocker to the flow, wait until all peas defined in `needs` completed.
+
+        :param needs: list of service names to wait
+        :return: the modified flow
+        """
+        if len(needs) <= 1:
+            raise FlowTopologyError('no need to wait for a single service, need len(needs) > 1')
+        return self.add(name='joiner', yaml_path='_merge', needs=needs, *args, **kwargs)
+
+    def add(self,
+            needs: Union[str, Tuple[str], List[str]] = None,
+            copy_flow: bool = True,
+            **kwargs) -> 'Flow':
+        """
+        Add a pod to the current flow object and return the new modified flow object.
+        The attribute of the pod can be later changed with :py:meth:`set` or deleted with :py:meth:`remove`
+
+        Note there are shortcut versions of this method.
+        Recommend to use :py:meth:`add_encoder`, :py:meth:`add_preprocessor`,
+        :py:meth:`add_router`, :py:meth:`add_indexer` whenever possible.
+
+        :param needs: the name of the pod(s) that this pod receives data from.
+                           One can also use 'pod.Gateway' to indicate the connection with the gateway.
+        :param copy_flow: when set to true, then always copy the current flow and do the modification on top of it then return, otherwise, do in-line modification
+        :param kwargs: other keyword-value arguments that the pod CLI supports
+        :return: a (new) flow object with modification
+        """
+
+        op_flow = copy.deepcopy(self) if copy_flow else self
+
+        pod_name = kwargs.get('name', None)
+
+        if pod_name in op_flow._pod_nodes:
+            raise FlowTopologyError('name: %s is used in this Flow already!' % pod_name)
+
+        if not pod_name:
+            pod_name = '%s%d' % ('pod', op_flow._pod_name_counter)
+            op_flow._pod_name_counter += 1
+
+        if not pod_name.isidentifier():
+            # hyphen - can not be used in the name
+            raise ValueError('name: %s is invalid, please follow the python variable name conventions' % pod_name)
+
+        needs = op_flow._parse_endpoints(op_flow, pod_name, needs, connect_to_last_pod=True)
+
+        kwargs.update(op_flow._common_kwargs)
+        kwargs['name'] = pod_name
+        kwargs['num_part'] = len(needs)
+        op_flow._pod_nodes[pod_name] = FlowPod(kwargs=kwargs, needs=needs)
+
+        op_flow.set_last_pod(pod_name, False)
+
+        return op_flow
+
+    def build(self, inplace: bool = True) -> 'Flow':
+        """
+        Build the current flow and make it ready to use
+
+        .. note::
+
+            No need to manually call it since 0.0.8. When using flow with the
+            context manager, or using :meth:`start`, :meth:`build` will be invoked.
+
+        :param inplace: if set to ``False`` then return the copy of the current flow.
+        :return: the current flow (by default)
+
+        .. note::
+            ``copy_flow=True`` is recommended if you are building the same flow multiple times in a row. e.g.
+
+            .. highlight:: python
+            .. code-block:: python
+
+                f = Flow()
+                with f:
+                    f.index()
+
+                with f.build(copy_flow=False) as fl:
+                    fl.search()
+
+        """
+
+        op_flow = self if inplace else copy.deepcopy(self)
+
+        _pod_edges = set()
+
+        if 'gateway' not in op_flow._pod_nodes:
+            op_flow._add_gateway(needs={op_flow._last_changed_pod[-1]})
+
+        # direct all income peas' output to the current service
+        for k, p in op_flow._pod_nodes.items():
+            for s in p.needs:
+                if s not in op_flow._pod_nodes:
+                    raise FlowMissingPodError('%s is not in this flow, misspelled name?' % s)
+                _pod_edges.add('%s-%s' % (s, k))
+
+        for k in _pod_edges:
+            s_name, e_name = k.split('-')
+            edges_with_same_start = [ed for ed in _pod_edges if ed.startswith(s_name)]
+            edges_with_same_end = [ed for ed in _pod_edges if ed.endswith(e_name)]
+
+            s_pod = op_flow._pod_nodes[s_name]
+            e_pod = op_flow._pod_nodes[e_name]
+
+            # Rule
+            # if a node has multiple income/outgoing peas,
+            # then its socket_in/out must be PULL_BIND or PUB_BIND
+            # otherwise it should be different than its income
+            # i.e. income=BIND => this=CONNECT, income=CONNECT => this = BIND
+            #
+            # when a socket is BIND, then host must NOT be set, aka default host 0.0.0.0
+            # host_in and host_out is only set when corresponding socket is CONNECT
+
+            if len(edges_with_same_start) > 1 and len(edges_with_same_end) == 1:
+                FlowPod.connect(s_pod, e_pod, first_socket_type=SocketType.PUB_BIND)
+            elif len(edges_with_same_start) == 1 and len(edges_with_same_end) > 1:
+                FlowPod.connect(s_pod, e_pod, first_socket_type=SocketType.PUSH_CONNECT)
+            elif len(edges_with_same_start) == 1 and len(edges_with_same_end) == 1:
+                # in this case, either side can be BIND
+                # we prefer gateway to be always CONNECT so that multiple clients can connect to it
+                # check if either node is gateway
+                # this is the only place where gateway appears
+                if s_name == 'gateway':
+                    if self.args.optimize_level > FlowOptimizeLevel.IGNORE_GATEWAY and e_pod.is_head_router:
+                        # connect gateway directly to peas
+                        e_pod.connect_to_tail_of(s_pod)
+                    else:
+                        FlowPod.connect(s_pod, e_pod, first_socket_type=SocketType.PUSH_CONNECT)
+                elif e_name == 'gateway':
+                    if self.args.optimize_level > FlowOptimizeLevel.IGNORE_GATEWAY and s_pod.is_tail_router and s_pod.tail_args.num_part == 1:
+                        # connect gateway directly to peas only if this is unblock router
+                        # as gateway can not block & reduce message
+                        s_pod.connect_to_head_of(e_pod)
+                    else:
+                        FlowPod.connect(s_pod, e_pod, first_socket_type=SocketType.PUSH_BIND)
+                else:
+                    e_pod.head_args.socket_in = s_pod.tail_args.socket_out.paired
+                    if self.args.optimize_level > FlowOptimizeLevel.NONE and e_pod.is_head_router and not s_pod.is_tail_router:
+                        e_pod.connect_to_tail_of(s_pod)
+                    elif self.args.optimize_level > FlowOptimizeLevel.NONE and s_pod.is_tail_router and s_pod.tail_args.num_part == 1:
+                        s_pod.connect_to_head_of(e_pod)
+                    else:
+                        FlowPod.connect(s_pod, e_pod, first_socket_type=SocketType.PUSH_CONNECT)
+            else:
+                raise FlowTopologyError('found %d edges start with %s and %d edges end with %s, '
+                                        'this type of topology is ambiguous and should not exist, '
+                                        'i can not determine the socket type' % (
+                                            len(edges_with_same_start), s_name, len(edges_with_same_end), e_name))
+
+        op_flow._build_level = FlowBuildLevel.GRAPH
+        return op_flow
+
+    def __call__(self, *args, **kwargs):
+        return self.build(*args, **kwargs)
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def _start_log_server(self):
+        try:
+            import urllib.request
+            import flask, flask_cors
+            self._sse_logger = threading.Thread(name='sentinel-sse-logger',
+                                                target=start_sse_logger, daemon=True,
+                                                args=(self.args.logserver_config,
+                                                      self.yaml_spec))
+            self._sse_logger.start()
+            time.sleep(1)
+            urllib.request.urlopen(JINA_GLOBAL.logserver.ready, timeout=5)
+            self.logger.success(f'logserver is started and available at {JINA_GLOBAL.logserver.address}')
+        except ModuleNotFoundError:
+            self.logger.error(
+                f'sse logserver can not start because of "flask" and "flask_cors" are missing, '
+                f'use pip install "jina[http]" (with double quotes) to install the dependencies')
+        except:
+            self.logger.error('logserver fails to start')
+
+    def start(self):
+        """Start to run all Pods in this Flow.
+
+        Remember to close the Flow with :meth:`close`.
+
+        Note that this method has a timeout of ``timeout_ready`` set in CLI,
+        which is inherited all the way from :class:`jina.peapods.peas.BasePea`
+        """
+
+        if self._build_level.value < FlowBuildLevel.GRAPH.value:
+            self.build(inplace=True)
+
+        if self.args.logserver:
+            self.logger.info('start logserver...')
+            self._start_log_server()
+
+        self._pod_stack = ExitStack()
+        for v in self._pod_nodes.values():
+            self._pod_stack.enter_context(v)
+
+        self.logger.info('%d Pods (i.e. %d Peas) are running in this Flow' % (
+            self.num_pods,
+            self.num_peas))
+
+        self.logger.success('flow is now ready for use, current build_level is %s' % self._build_level)
+
+        return self
+
+    @property
+    def num_pods(self) -> int:
+        """Get the number of pods in this flow"""
+        return len(self._pod_nodes)
+
+    @property
+    def num_peas(self) -> int:
+        """Get the number of peas (replicas count) in this flow"""
+        return sum(v.num_peas for v in self._pod_nodes.values())
+
+    def close(self):
+        """Close the flow and release all resources associated to it. """
+        if hasattr(self, '_pod_stack'):
+            self._pod_stack.close()
+        # if hasattr(self, 'sse_logger') and self.sse_logger.is_alive():
+        #     self.sse_logger.stop()
+        self._build_level = FlowBuildLevel.EMPTY
+        # time.sleep(1)  # sleep for a while until all resources are safely closed
+        self.logger.success(
+            'flow is closed and all resources should be released already, current build level is %s' % self._build_level)
+
+    def __eq__(self, other: 'Flow'):
+        """
+        Comparing the topology of a flow with another flow.
+        Identification is defined by whether two flows share the same set of edges.
+
+        :param other: the second flow object
+        """
+
+        if self._build_level.value < FlowBuildLevel.GRAPH.value:
+            a = self.build()
+        else:
+            a = self
+
+        if other._build_level.value < FlowBuildLevel.GRAPH.value:
+            b = other.build()
+        else:
+            b = other
+
+        return a._pod_nodes == b._pod_nodes
+
+    @build_required(FlowBuildLevel.GRAPH)
+    def _get_client(self, **kwargs):
+        kwargs.update(self._common_kwargs)
+        from ..clients import py_client
+        if 'port_grpc' not in kwargs:
+            kwargs['port_grpc'] = self.port_grpc
+        if 'host' not in kwargs:
+            kwargs['host'] = self.host
+        return py_client(**kwargs)
+
+    @deprecated_alias(buffer='input_fn', callback='output_fn')
+    def train(self, input_fn: Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable] = None,
+              output_fn: Callable[['jina_pb2.Message'], None] = None,
+              **kwargs):
+        """Do training on the current flow
+
+        It will start a :py:class:`CLIClient` and call :py:func:`train`.
+
+        Example,
+
+        .. highlight:: python
+        .. code-block:: python
+
+            with f.build(runtime='thread') as flow:
+                flow.train(txt_file='aa.txt')
+                flow.train(image_zip_file='aa.zip', batch_size=64)
+                flow.train(video_zip_file='aa.zip')
+                ...
+
+
+        This will call the pre-built reader to read files into an iterator of bytes and feed to the flow.
+
+        One may also build a reader/generator on your own.
+
+        Example,
+
+        .. highlight:: python
+        .. code-block:: python
+
+            def my_reader():
+                for _ in range(10):
+                    yield b'abcdfeg'   # each yield generates a document for training
+
+            with f.build(runtime='thread') as flow:
+                flow.train(bytes_gen=my_reader())
+
+        :param input_fn: An iterator of bytes. If not given, then you have to specify it in `kwargs`.
+        :param output_fn: the callback function to invoke after training
+        :param kwargs: accepts all keyword arguments of `jina client` CLI
+        """
+        self._get_client(**kwargs).train(input_fn, output_fn)
+
+    @deprecated_alias(buffer='input_fn', callback='output_fn')
+    def index(self, input_fn: Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable] = None,
+              output_fn: Callable[['jina_pb2.Message'], None] = None,
+              **kwargs):
+        """Do indexing on the current flow
+
+        Example,
+
+        .. highlight:: python
+        .. code-block:: python
+
+            with f.build(runtime='thread') as flow:
+                flow.index(txt_file='aa.txt')
+                flow.index(image_zip_file='aa.zip', batch_size=64)
+                flow.index(video_zip_file='aa.zip')
+                ...
+
+
+        This will call the pre-built reader to read files into an iterator of bytes and feed to the flow.
+
+        One may also build a reader/generator on your own.
+
+        Example,
+
+        .. highlight:: python
+        .. code-block:: python
+
+            def my_reader():
+                for _ in range(10):
+                    yield b'abcdfeg'  # each yield generates a document to index
+
+            with f.build(runtime='thread') as flow:
+                flow.index(bytes_gen=my_reader())
+
+        It will start a :py:class:`CLIClient` and call :py:func:`index`.
+
+        :param input_fn: An iterator of bytes. If not given, then you have to specify it in `kwargs`.
+        :param output_fn: the callback function to invoke after indexing
+        :param kwargs: accepts all keyword arguments of `jina client` CLI
+        """
+        self._get_client(**kwargs).index(input_fn, output_fn)
+
+    @deprecated_alias(buffer='input_fn', callback='output_fn')
+    def search(self, input_fn: Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable] = None,
+               output_fn: Callable[['jina_pb2.Message'], None] = None,
+               **kwargs):
+        """Do indexing on the current flow
+
+        It will start a :py:class:`CLIClient` and call :py:func:`search`.
+
+
+        Example,
+
+        .. highlight:: python
+        .. code-block:: python
+
+            with f.build(runtime='thread') as flow:
+                flow.search(txt_file='aa.txt')
+                flow.search(image_zip_file='aa.zip', batch_size=64)
+                flow.search(video_zip_file='aa.zip')
+                ...
+
+
+        This will call the pre-built reader to read files into an iterator of bytes and feed to the flow.
+
+        One may also build a reader/generator on your own.
+
+        Example,
+
+        .. highlight:: python
+        .. code-block:: python
+
+            def my_reader():
+                for _ in range(10):
+                    yield b'abcdfeg'   # each yield generates a query for searching
+
+            with f.build(runtime='thread') as flow:
+                flow.search(bytes_gen=my_reader())
+
+        :param input_fn: An iterator of bytes. If not given, then you have to specify it in `kwargs`.
+        :param output_fn: the callback function to invoke after searching
+        :param kwargs: accepts all keyword arguments of `jina client` CLI
+        """
+        self._get_client(**kwargs).search(input_fn, output_fn)
+
+    def dry_run(self, **kwargs):
+        """Send a DRYRUN request to this flow, passing through all pods in this flow
+        useful for testing connectivity and debugging"""
+        if not self._get_client(**kwargs).dry_run():
+            raise FlowConnectivityError('a dry run shows this flow is badly connected due to the network settings')
+
+    @build_required(FlowBuildLevel.GRAPH)
+    def to_swarm_yaml(self, path: TextIO):
+        """
+        Generate the docker swarm YAML compose file
+
+        :param path: the output yaml path
+        """
+        swarm_yml = {'version': '3.4',
+                     'services': {}}
+
+        for k, v in self._pod_nodes.items():
+            swarm_yml['services'][k] = {
+                'command': v.to_cli_command(),
+                'deploy': {'replicas': 1}
+            }
+
+        yaml.dump(swarm_yml, path)
+
+    @property
+    @build_required(FlowBuildLevel.GRAPH)
+    def port_grpc(self):
+        return self._pod_nodes['gateway'].port_grpc
+
+    @property
+    @build_required(FlowBuildLevel.GRAPH)
+    def host(self):
+        return self._pod_nodes['gateway'].host
+
+    def __iter__(self):
+        return self._pod_nodes.values().__iter__()
+
+    def block(self):
+        """Block the process until user hits KeyboardInterrupt """
+        try:
+            self.logger.success(f'flow is started at {self.host}:{self.port_grpc}, '
+                                f'you can now use client to send request!')
+            threading.Event().wait()
+        except KeyboardInterrupt:
+            pass
+
+    def use_grpc_gateway(self):
+        """Change to use gRPC gateway for IO """
+        self._common_kwargs['rest_api'] = False
+
+    def use_rest_gateway(self):
+        """Change to use REST gateway for IO """
+        self._common_kwargs['rest_api'] = True
+
+__copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
+__license__ = "Apache-2.0"
+
+import argparse
+import copy
+import time
+from contextlib import ExitStack
+from queue import Empty
+from threading import Thread
+from typing import Set, Dict, List, Callable, Union
+
+from . import Pea
+from .gateway import GatewayPea, RESTGatewayPea
+from .pea import BasePea
+from .. import __default_host__
+from ..enums import *
+from ..helper import random_port, get_random_identity, get_parsed_args, get_non_defaults_args
+from ..main.parser import set_pod_parser, set_gateway_parser
+
+
+class BasePod:
+    """A BasePod is a immutable set of peas, which run in parallel. They share the same input and output socket.
+    Internally, the peas can run with the process/thread backend. They can be also run in their own containers
+    """
+
+    def __init__(self, args: Union['argparse.Namespace', Dict]):
+        """
+
+        :param args: arguments parsed from the CLI
+        """
+        self.peas = []
+        self.is_head_router = False
+        self.is_tail_router = False
+        self.deducted_head = None
+        self.deducted_tail = None
+        self._args = args
+        self.peas_args = self._parse_args(args)
+
+    @property
+    def is_idle(self) -> bool:
+        """A Pod is idle when all its peas are idle, see also :attr:`jina.peapods.pea.Pea.is_idle`.
+        """
+        return all(p.is_idle for p in self.peas if p.is_ready.is_set())
+
+    def close_if_idle(self):
+        """Check every second if the pod is in idle, if yes, then close the pod"""
+        while True:
+            if self.is_idle:
+                self.close()
+                break  # only run once
+            time.sleep(1)
+
+    @property
+    def name(self) -> str:
+        """The name of this :class:`BasePod`. """
+        return self.peas_args['peas'][0].name
+
+    @property
+    def port_grpc(self) -> int:
+        """Get the grpc port number """
+        return self.peas_args['peas'][0].port_grpc
+
+    @property
+    def host(self) -> str:
+        """Get the grpc host name """
+        return self.peas_args['peas'][0].host
+
+    def _parse_args(self, args):
+        peas_args = {
+            'head': None,
+            'tail': None,
+            'peas': []
+        }
+
+        if getattr(args, 'replicas', 1) > 1:
+            # reasons to separate head and tail from peas is that they
+            # can be deducted based on the previous and next pods
+            peas_args['head'] = _copy_to_head_args(args, args.polling.is_push)
+            peas_args['tail'] = _copy_to_tail_args(args,
+                                                   args.replicas if args.polling.is_block else 1)
+            peas_args['peas'] = _set_peas_args(args, peas_args['head'], peas_args['tail'])
+            self.is_head_router = True
+            self.is_tail_router = True
+        else:
+            peas_args['peas'] = [args]
+
+        # note that peas_args['peas'][0] exist either way and carries the original property
+        return peas_args
+
+    @property
+    def head_args(self):
+        """Get the arguments for the `head` of this BasePod. """
+        if self.is_head_router and self.peas_args['head']:
+            return self.peas_args['head']
+        elif not self.is_head_router and len(self.peas_args['peas']) == 1:
+            return self.peas_args['peas'][0]
+        elif self.deducted_head:
+            return self.deducted_head
+        else:
+            raise ValueError('ambiguous head node, maybe it is deducted already?')
+
+    @head_args.setter
+    def head_args(self, args):
+        """Set the arguments for the `head` of this BasePod. """
+        if self.is_head_router and self.peas_args['head']:
+            self.peas_args['head'] = args
+        elif not self.is_head_router and len(self.peas_args['peas']) == 1:
+            self.peas_args['peas'][0] = args
+        elif self.deducted_head:
+            self.deducted_head = args
+        else:
+            raise ValueError('ambiguous head node, maybe it is deducted already?')
+
+    @property
+    def tail_args(self):
+        """Get the arguments for the `tail` of this BasePod. """
+        if self.is_tail_router and self.peas_args['tail']:
+            return self.peas_args['tail']
+        elif not self.is_tail_router and len(self.peas_args['peas']) == 1:
+            return self.peas_args['peas'][0]
+        elif self.deducted_tail:
+            return self.deducted_tail
+        else:
+            raise ValueError('ambiguous tail node, maybe it is deducted already?')
+
+    @tail_args.setter
+    def tail_args(self, args):
+        """Get the arguments for the `tail` of this BasePod. """
+        if self.is_tail_router and self.peas_args['tail']:
+            self.peas_args['tail'] = args
+        elif not self.is_tail_router and len(self.peas_args['peas']) == 1:
+            self.peas_args['peas'][0] = args
+        elif self.deducted_tail:
+            self.deducted_tail = args
+        else:
+            raise ValueError('ambiguous tail node, maybe it is deducted already?')
+
+    @property
+    def all_args(self):
+        """Get all arguments of all Peas in this BasePod. """
+        return self.peas_args['peas'] + (
+            [self.peas_args['head']] if self.peas_args['head'] else []) + (
+                   [self.peas_args['tail']] if self.peas_args['tail'] else [])
+
+    @property
+    def num_peas(self) -> int:
+        """Get the number of running :class:`BasePea`"""
+        return len(self.peas)
+
+    def __eq__(self, other: 'BasePod'):
+        return self.num_peas == other.num_peas and self.name == other.name
+
+    def set_runtime(self, runtime: str):
+        """Set the parallel runtime of this BasePod.
+
+        :param runtime: possible values: process, thread
+        """
+        for s in self.all_args:
+            s.runtime = runtime
+            # for thread and process backend which runs locally, host_in and host_out should not be set
+            # s.host_in = __default_host__
+            # s.host_out = __default_host__
+
+    def start_sentinels(self):
+        self.sentinel_threads = []
+        if isinstance(self._args, argparse.Namespace) and getattr(self._args, 'shutdown_idle', False):
+            self.sentinel_threads.append(Thread(target=self.close_if_idle,
+                                                name='sentinel-shutdown-idle',
+                                                daemon=True))
+        for t in self.sentinel_threads:
+            t.start()
+
+    def start(self):
+        """Start to run all Peas in this BasePod.
+
+        Remember to close the BasePod with :meth:`close`.
+
+        Note that this method has a timeout of ``timeout_ready`` set in CLI,
+        which is inherited from :class:`jina.peapods.peas.BasePea`
+        """
+        self.stack = ExitStack()
+        # start head and tail
+        if self.peas_args['head']:
+            p = BasePea(self.peas_args['head'])
+            self.peas.append(p)
+            self.stack.enter_context(p)
+
+        if self.peas_args['tail']:
+            p = BasePea(self.peas_args['tail'])
+            self.peas.append(p)
+            self.stack.enter_context(p)
+
+        # start real peas and accumulate the storage id
+        if len(self.peas_args['peas']) > 1:
+            start_rep_id = 1
+        else:
+            start_rep_id = 0
+        for idx, _args in enumerate(self.peas_args['peas'], start=start_rep_id):
+            _args.replica_id = idx
+            _args.role = PeaRoleType.REPLICA
+            p = Pea(_args, allow_remote=False)
+            self.peas.append(p)
+            self.stack.enter_context(p)
+
+        self.start_sentinels()
+        return self
+
+    @property
+    def log_iterator(self):
+        """Get the last log using iterator
+
+        The :class:`BasePod` log iterator goes through all peas :attr:`log_iterator` and
+        poll them sequentially. If non all them is active anymore, aka :attr:`is_event_loop`
+        is False, then the iterator ends.
+
+        .. warning::
+
+            The log may not strictly follow the time order given that we are polling the log
+            from all peas in the sequential manner.
+        """
+        from ..logging.queue import __log_queue__
+        while not self.is_shutdown:
+            try:
+                yield __log_queue__.get_nowait()
+            except Empty:
+                pass
+
+    @property
+    def is_shutdown(self) -> bool:
+        return all(not p.is_ready.is_set() for p in self.peas)
+
+    def __enter__(self):
+        return self.start()
+
+    @property
+    def status(self) -> List:
+        """The status of a BasePod is the list of status of all its Peas """
+        return [p.status for p in self.peas]
+
+    def is_ready(self) -> bool:
+        """Wait till the ready signal of this BasePod.
+
+        The pod is ready only when all the contained Peas returns is_ready
+        """
+        for p in self.peas:
+            p.is_ready.wait()
+        return True
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def join(self):
+        """Wait until all peas exit"""
+        try:
+            for s in self.peas:
+                s.join()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.peas.clear()
+
+    def close(self):
+        self.stack.close()
+
+
+class MutablePod(BasePod):
+    """A :class:`MutablePod` is a pod where all peas and their connections are given"""
+
+    def _parse_args(self, args):
+        return args
+
+
+class FlowPod(BasePod):
+    """A :class:`FlowPod` is like a :class:`BasePod`, but it exposes more interfaces for tweaking its connections with
+    other Pods, which comes in handy when used in the Flow API
+    """
+
+    def __init__(self, kwargs: Dict,
+                 needs: Set[str] = None, parser: Callable = set_pod_parser):
+        """
+
+        :param kwargs: unparsed argument in dict, if given the
+        :param needs: a list of names this BasePod needs to receive message from
+        """
+        _parser = parser()
+        self.cli_args, self._args, self.unk_args = get_parsed_args(kwargs, _parser, 'FlowPod')
+        super().__init__(self._args)
+        self.needs = needs if needs else set()  #: used in the :class:`jina.flow.Flow` to build the graph
+        self._kwargs = get_non_defaults_args(self._args, _parser)
+
+    def to_cli_command(self):
+        if isinstance(self, GatewayPod):
+            cmd = 'jina gateway'
+        else:
+            cmd = 'jina pod'
+
+        return '%s %s' % (cmd, ' '.join(self.cli_args))
+
+    @staticmethod
+    def connect(first: 'BasePod', second: 'BasePod', first_socket_type: 'SocketType'):
+        """Connect two Pods
+
+        :param first: the first BasePod
+        :param second: the second BasePod
+        :param first_socket_type: socket type of the first BasePod, availables are PUSH_BIND, PUSH_CONNECT, PUB_BIND
+        """
+        if first_socket_type == SocketType.PUSH_BIND:
+            first.tail_args.socket_out = SocketType.PUSH_BIND
+            second.head_args.socket_in = SocketType.PULL_CONNECT
+
+            first.tail_args.host_out = __default_host__
+            second.head_args.host_in = _fill_in_host(bind_args=first.tail_args,
+                                                     connect_args=second.head_args)
+            second.head_args.port_in = first.tail_args.port_out
+        elif first_socket_type == SocketType.PUSH_CONNECT:
+            first.tail_args.socket_out = SocketType.PUSH_CONNECT
+            second.head_args.socket_in = SocketType.PULL_BIND
+
+            first.tail_args.host_out = _fill_in_host(connect_args=first.tail_args,
+                                                     bind_args=second.head_args)
+            second.head_args.host_in = __default_host__
+            first.tail_args.port_out = second.head_args.port_in
+        elif first_socket_type == SocketType.PUB_BIND:
+            first.tail_args.socket_out = SocketType.PUB_BIND
+            second.head_args.socket_in = SocketType.SUB_CONNECT
+
+            first.tail_args.host_out = __default_host__  # bind always get default 0.0.0.0
+            second.head_args.host_in = _fill_in_host(bind_args=first.tail_args,
+                                                     connect_args=second.head_args)  # the hostname of s_pod
+            second.head_args.port_in = first.tail_args.port_out
+        else:
+            raise NotImplementedError('%r is not supported here' % first_socket_type)
+
+    def connect_to_tail_of(self, pod: 'BasePod'):
+        """Eliminate the head node by connecting prev_args node directly to peas """
+        if self._args.replicas > 1 and self.is_head_router:
+            # keep the port_in and socket_in of prev_args
+            # only reset its output
+            pod.tail_args = _copy_to_head_args(pod.tail_args, self._args.polling.is_push, as_router=False)
+            # update peas to receive from it
+            self.peas_args['peas'] = _set_peas_args(self._args, pod.tail_args, self.tail_args)
+            # remove the head node
+            self.peas_args['head'] = None
+            # head is no longer a router anymore
+            self.is_head_router = False
+            self.deducted_head = pod.tail_args
+        else:
+            raise ValueError('the current pod has no head router, deduct the head is confusing')
+
+    def connect_to_head_of(self, pod: 'BasePod'):
+        """Eliminate the tail node by connecting next_args node directly to peas """
+        if self._args.replicas > 1 and self.is_tail_router:
+            # keep the port_out and socket_out of next_arts
+            # only reset its input
+            pod.head_args = _copy_to_tail_args(pod.head_args,
+                                               self._args.replicas if self._args.polling.is_block else 1,
+                                               as_router=False)
+            # update peas to receive from it
+            self.peas_args['peas'] = _set_peas_args(self._args, self.head_args, pod.head_args)
+            # remove the head node
+            self.peas_args['tail'] = None
+            # head is no longer a router anymore
+            self.is_tail_router = False
+            self.deducted_tail = pod.head_args
+        else:
+            raise ValueError('the current pod has no tail router, deduct the tail is confusing')
+
+    def start(self):
+        if self._args.host == __default_host__:
+            return super().start()
+        else:
+            from .remote import RemoteMutablePod
+            _remote_pod = RemoteMutablePod(self.peas_args)
+            self.stack = ExitStack()
+            self.stack.enter_context(_remote_pod)
+            self.start_sentinels()
+            return self
+
+
+def _set_peas_args(args, head_args, tail_args):
+    result = []
+    for _ in range(args.replicas):
+        _args = copy.deepcopy(args)
+        _args.port_in = head_args.port_out
+        _args.port_out = tail_args.port_in
+        _args.port_ctrl = random_port()
+        _args.identity = get_random_identity()
+        _args.socket_out = SocketType.PUSH_CONNECT
+        if args.polling.is_push:
+            if args.scheduling == SchedulerType.ROUND_ROBIN:
+                _args.socket_in = SocketType.PULL_CONNECT
+            elif args.scheduling == SchedulerType.LOAD_BALANCE:
+                _args.socket_in = SocketType.DEALER_CONNECT
+            else:
+                raise NotImplementedError
+        else:
+            _args.socket_in = SocketType.SUB_CONNECT
+        _args.host_in = _fill_in_host(bind_args=head_args, connect_args=_args)
+        _args.host_out = _fill_in_host(bind_args=tail_args, connect_args=_args)
+        result.append(_args)
+    return result
+
+
+def _copy_to_head_args(args, is_push: bool, as_router: bool = True):
+    """Set the outgoing args of the head router"""
+
+    _head_args = copy.deepcopy(args)
+    _head_args.port_ctrl = random_port()
+    _head_args.port_out = random_port()
+    if is_push:
+        if args.scheduling == SchedulerType.ROUND_ROBIN:
+            _head_args.socket_out = SocketType.PUSH_BIND
+            if as_router:
+                _head_args.yaml_path = '_forward'
+        elif args.scheduling == SchedulerType.LOAD_BALANCE:
+            _head_args.socket_out = SocketType.ROUTER_BIND
+            if as_router:
+                _head_args.yaml_path = '_route'
+    else:
+        _head_args.socket_out = SocketType.PUB_BIND
+        if as_router:
+            _head_args.yaml_path = '_forward'
+
+    if as_router:
+        _head_args.name = args.name or ''
+        _head_args.role = PeaRoleType.HEAD
+
+    # head and tail never run in docker, reset their image to None
+    _head_args.image = None
+    return _head_args
+
+
+def _copy_to_tail_args(args, num_part: int, as_router: bool = True):
+    """Set the incoming args of the tail router"""
+
+    _tail_args = copy.deepcopy(args)
+    _tail_args.port_in = random_port()
+    _tail_args.port_ctrl = random_port()
+    _tail_args.socket_in = SocketType.PULL_BIND
+    if as_router:
+        _tail_args.yaml_path = args.reducing_yaml_path
+        _tail_args.name = args.name or ''
+        _tail_args.role = PeaRoleType.TAIL
+    _tail_args.num_part = num_part
+
+    # head and tail never run in docker, reset their image to None
+    _tail_args.image = None
+    return _tail_args
+
+
+def _fill_in_host(bind_args, connect_args):
+    from sys import platform
+
+    bind_local = (bind_args.host == '0.0.0.0')
+    bind_docker = (bind_args.image is not None and bind_args.image)
+    conn_tail = (connect_args.name is not None and connect_args.role == PeaRoleType.TAIL)
+    conn_local = (connect_args.host == '0.0.0.0')
+    conn_docker = (connect_args.image is not None and connect_args.image)
+    bind_conn_same_remote = not bind_local and not conn_local and (bind_args.host == connect_args.host)
+    if platform == "linux" or platform == "linux2":
+        local_host = '0.0.0.0'
+    else:
+        local_host = 'host.docker.internal'
+
+    if bind_local and conn_local and conn_docker:
+        return local_host
+    elif bind_local and conn_local and not conn_docker:
+        return __default_host__
+    elif not bind_local and bind_conn_same_remote:
+        if conn_docker:
+            return local_host
+        else:
+            return __default_host__
+    else:
+        return bind_args.host
+
+
+class GatewayPod(BasePod):
+    """A :class:`BasePod` that holds a Gateway """
+
+    def start(self):
+        self.stack = ExitStack()
+        for s in self.all_args:
+            p = RESTGatewayPea(s) if getattr(s, 'rest_api', False) else GatewayPea(s)
+            self.peas.append(p)
+            self.stack.enter_context(p)
+
+        self.start_sentinels()
+        return self
+
+
+class GatewayFlowPod(GatewayPod, FlowPod):
+    """A :class:`FlowPod` that holds a Gateway """
+
+    def __init__(self, kwargs: Dict = None, needs: Set[str] = None):
+        FlowPod.__init__(self, kwargs, needs, parser=set_gateway_parser)
+__copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
+__license__ = "Apache-2.0"
+
+import argparse
+import multiprocessing
+import os
+import threading
+import time
+from collections import defaultdict
+from queue import Empty
+from typing import Dict, List, Optional, Union
+
+import zmq
+
+from .zmq import send_ctrl_message, Zmqlet
+from .. import __ready_msg__, __stop_msg__
+from ..drivers.helper import routes2str, add_route
+from ..enums import PeaRoleType
+from ..excepts import NoExplicitMessage, ExecutorFailToLoad, MemoryOverHighWatermark, UnknownControlCommand, \
+    RequestLoopEnd, \
+    DriverNotInstalled, NoDriverForRequest
+from ..executors import BaseExecutor
+from ..logging import get_logger
+from ..logging.profile import used_memory, TimeDict
+from ..proto import jina_pb2, is_data_request
+
+__all__ = ['PeaMeta', 'BasePea']
+
+
+class PeaMeta(type):
+    """Meta class of :class:`BasePea` to enable switching between ``thread`` and ``process`` backend. """
+    _dct = {}
+
+    def __new__(cls, name, bases, dct):
+        _cls = super().__new__(cls, name, bases, dct)
+        PeaMeta._dct.update({name: {'cls': cls,
+                                    'name': name,
+                                    'bases': bases,
+                                    'dct': dct}})
+        return _cls
+
+    def __call__(cls, *args, **kwargs):
+        # switch to the new backend
+        _cls = {
+            'thread': threading.Thread,
+            'process': multiprocessing.Process,
+        }.get(getattr(args[0], 'runtime', 'thread'))
+
+        # rebuild the class according to mro
+        for c in cls.mro()[-2::-1]:
+            arg_cls = PeaMeta._dct[c.__name__]['cls']
+            arg_name = PeaMeta._dct[c.__name__]['name']
+            arg_dct = PeaMeta._dct[c.__name__]['dct']
+            _cls = super().__new__(arg_cls, arg_name, (_cls,), arg_dct)
+
+        return type.__call__(_cls, *args, **kwargs)
+
+
+def _get_event(obj):
+    if isinstance(obj, threading.Thread):
+        return threading.Event()
+    elif isinstance(obj, multiprocessing.Process):
+        return multiprocessing.Event()
+    else:
+        raise NotImplementedError
+
+
+def _make_or_event(obj, *events):
+    or_event = _get_event(obj)
+
+    def or_set(self):
+        self._set()
+        self.changed()
+
+    def or_clear(self):
+        self._clear()
+        self.changed()
+
+    def orify(e, changed_callback):
+        e._set = e.set
+        e._clear = e.clear
+        e.changed = changed_callback
+        e.set = lambda: or_set(e)
+        e.clear = lambda: or_clear(e)
+
+    def changed():
+        bools = [e.is_set() for e in events]
+        if any(bools):
+            or_event.set()
+        else:
+            or_event.clear()
+
+    for e in events:
+        orify(e, changed)
+    changed()
+    return or_event
+
+
+class BasePea(metaclass=PeaMeta):
+    """BasePea is an unary service unit which provides network interface and
+    communicates with others via protobuf and ZeroMQ
+    """
+
+    def __init__(self, args: Union['argparse.Namespace', Dict]):
+        """ Create a new :class:`BasePea` object
+
+        :param args: the arguments received from the CLI
+        :param replica_id: the id used to separate the storage of each pea, only used when ``args.separate_storage=True``
+        """
+        super().__init__()
+        self.args = args
+        self.name = self.__class__.__name__  #: this is the process name
+        self.daemon = True
+
+        self.is_ready = _get_event(self)
+        self.is_shutdown = _get_event(self)
+        self.ready_or_shutdown = _make_or_event(self, self.is_ready, self.is_shutdown)
+        self.is_shutdown.clear()
+
+        # self.is_busy = _get_event(self)
+        # # label the pea as busy until the loop body start
+        # self.is_busy.set()
+
+        self.last_active_time = time.perf_counter()
+        self.last_dump_time = time.perf_counter()
+
+        self._timer = TimeDict()
+
+        self._request = None
+        self._message = None
+        self._prev_requests = None
+        self._prev_messages = None
+        self._pending_msgs = defaultdict(list)  # type: Dict[str, List]
+
+        if isinstance(args, argparse.Namespace):
+            if args.name:
+                self.name = args.name
+            if args.role == PeaRoleType.HEAD:
+                self.name = '%s-head' % self.name
+            elif args.role == PeaRoleType.TAIL:
+                self.name = '%s-tail' % self.name
+            elif args.role == PeaRoleType.REPLICA:
+                self.name = '%s-%d' % (self.name, args.replica_id)
+            self.ctrl_addr, self.ctrl_with_ipc = Zmqlet.get_ctrl_address(args)
+            if not args.log_with_own_name and args.name:
+                # everything in this Pea (process) will use the same name for display the log
+                os.environ['JINA_POD_NAME'] = args.name
+            self.logger = get_logger(self.name, **vars(args))
+        else:
+            self.logger = get_logger(self.name)
+
+    def handle(self, msg: 'jina_pb2.Message') -> 'BasePea':
+        """Register the current message to this pea, so that all message-related properties are up-to-date, including
+        :attr:`request`, :attr:`prev_requests`, :attr:`message`, :attr:`prev_messages`. And then call the executor to handle
+        this message.
+
+        :param msg: the message received
+        """
+        self._request = getattr(msg.request, msg.request.WhichOneof('body'))
+        self._message = msg
+        req_type = type(self._request)
+
+        if self.args.num_part > 1 and is_data_request(self._request):
+            # do gathering, not for control request, unless it is dryrun
+            req_id = msg.envelope.request_id
+            self._pending_msgs[req_id].append(msg)
+            num_req = len(self._pending_msgs[req_id])
+
+            if num_req == self.args.num_part:
+                self._prev_messages = self._pending_msgs.pop(req_id)
+                self._prev_requests = [getattr(v.request, v.request.WhichOneof('body')) for v in self._prev_messages]
+            else:
+                raise NoExplicitMessage
+            self.logger.info(f'collected {num_req}/{self.args.num_part} parts of {req_type.__name__}')
+        else:
+            self._prev_requests = None
+            self._prev_messages = None
+
+        self.executor(self.request_type)
+        return self
+
+    @property
+    def is_idle(self) -> bool:
+        """Return ``True`` when current time is ``max_idle_time`` seconds late than the last active time"""
+        return (time.perf_counter() - self.last_active_time) > self.args.max_idle_time
+
+    @property
+    def request(self) -> 'jina_pb2.Request':
+        """Get the current request body inside the protobuf message"""
+        return self._request
+
+    @property
+    def prev_requests(self) -> List['jina_pb2.Request']:
+        """Get all previous requests that has the same ``request_id``
+
+        This returns ``None`` when ``num_part=1``.
+        """
+        return self._prev_requests
+
+    @property
+    def message(self) -> 'jina_pb2.Message':
+        """Get the current protobuf message to be processed"""
+        return self._message
+
+    @property
+    def request_type(self) -> str:
+        return self._request.__class__.__name__
+
+    @property
+    def prev_messages(self) -> List['jina_pb2.Message']:
+        """Get all previous messages that has the same ``request_id``
+
+        This returns ``None`` when ``num_part=1``.
+        """
+        return self._prev_messages
+
+    @property
+    def log_iterator(self):
+        """Get the last log using iterator """
+        from ..logging.queue import __log_queue__
+        while self.is_ready.is_set():
+            try:
+                yield __log_queue__.get_nowait()
+            except Empty:
+                pass
+
+    def load_executor(self):
+        """Load the executor to this BasePea, specified by ``exec_yaml_path`` CLI argument.
+
+        """
+        if self.args.yaml_path:
+            try:
+                self.executor = BaseExecutor.load_config(self.args.yaml_path,
+                                                         self.args.separated_workspace, self.args.replica_id)
+                self.executor.attach(pea=self)
+                # self.logger = get_logger('%s(%s)' % (self.name, self.executor.name), **vars(self.args))
+            except FileNotFoundError:
+                raise ExecutorFailToLoad
+        else:
+            self.logger.warning('this BasePea has no executor attached, you may want to double-check '
+                                'if it is a mistake or on purpose (using this BasePea as router/map-reduce)')
+
+    def print_stats(self):
+        self.logger.info(
+            ' '.join('%s: %.2f' % (k, v / self._timer.accum_time['loop']) for k, v in self._timer.accum_time.items()))
+
+    def save_executor(self, dump_interval: int = 0):
+        """Save the contained executor
+
+        :param dump_interval: the time interval for saving
+        """
+
+        if ((time.perf_counter() - self.last_dump_time) > self.args.dump_interval > 0) or dump_interval <= 0:
+            if self.args.read_only:
+                self.logger.debug('executor is not saved as "read_only" is set to true for this BasePea')
+            elif not hasattr(self, 'executor'):
+                self.logger.debug('this BasePea contains no executor, no need to save')
+            elif self.executor.save():
+                self.logger.info('dumped changes to the executor, %3.0fs since last the save'
+                                 % (time.perf_counter() - self.last_dump_time))
+            else:
+                self.logger.info('executor says there is nothing to save')
+            self.last_dump_time = time.perf_counter()
+            if hasattr(self, 'zmqlet'):
+                self.zmqlet.print_stats()
+
+    def pre_hook(self, msg: 'jina_pb2.Message') -> 'BasePea':
+        """Pre-hook function, what to do after first receiving the message """
+        msg_type = msg.request.WhichOneof('body')
+        self.logger.info('received "%s" from %s' % (msg_type, routes2str(msg, flag_current=True)))
+        add_route(msg.envelope, self.name, self.args.identity)
+        return self
+
+    def post_hook(self, msg: 'jina_pb2.Message') -> 'BasePea':
+        """Post-hook function, what to do before handing out the message """
+        msg.envelope.routes[-1].end_time.GetCurrentTime()
+        return self
+
+    def set_ready(self, *args, **kwargs):
+        """Set the status of the pea to ready """
+        self.is_ready.set()
+        self.logger.success(__ready_msg__)
+
+    def unset_ready(self, *args, **kwargs):
+        """Set the status of the pea to shutdown """
+        self.is_ready.clear()
+        self.logger.success(__stop_msg__)
+
+    def _callback(self, msg):
+        # self.is_busy.set()
+        self.pre_hook(msg).handle(msg).post_hook(msg)
+        self.last_active_time = time.perf_counter()
+        return msg
+
+    def msg_callback(self, msg: 'jina_pb2.Message') -> Optional['jina_pb2.Message']:
+        """Callback function after receiving the message
+
+        When nothing is returned then the nothing is send out via :attr:`zmqlet.sock_out`.
+        """
+        try:
+            return self._callback(msg)
+        except NoExplicitMessage:
+            # silent and do not propagade message anymore
+            # 1. wait partial message to be finished
+            # 2. dealer send a control message and no need to go on
+            pass
+
+    def loop_body(self):
+        """The body of the request loop
+
+        .. note::
+
+            Class inherited from :class:`BasePea` must override this function. And add
+            :meth:`set_ready` when your loop body is started
+        """
+        self.load_plugins()
+        self.load_executor()
+        self.zmqlet = Zmqlet(self.args, logger=self.logger)
+        self.set_ready()
+
+        while True:
+            # t_loop_start = time.perf_counter()
+            msg = self.zmqlet.recv_message(callback=self.msg_callback)
+            # t_callback = time.perf_counter()
+
+            if msg:
+                self.zmqlet.send_message(msg)
+
+                self.save_executor(self.args.dump_interval)
+                self.check_memory_watermark()
+                # self.is_busy.clear()
+            # t_loop_end = time.perf_counter()
+            # self.logger.info(f'handle {(t_callback - t_loop_start) / (t_loop_end - t_loop_start):2.2f}')
+
+    def load_plugins(self):
+        if self.args.py_modules:
+            from ..helper import PathImporter
+            PathImporter.add_modules(*self.args.py_modules)
+
+    def loop_teardown(self):
+        """Stop the request loop """
+        if hasattr(self, 'executor'):
+            if not self.args.exit_no_dump:
+                self.save_executor(dump_interval=0)
+            self.executor.close()
+        if hasattr(self, 'zmqlet'):
+            if self.request_type == 'ControlRequest' and \
+                    self.request.command == jina_pb2.Request.ControlRequest.TERMINATE:
+                # the last message is a terminate request
+                # return it and tells the client everything is now closed.
+                self.zmqlet.send_message(self.message)
+            self.zmqlet.close()
+
+    def run(self):
+        """Start the request loop of this BasePea. It will listen to the network protobuf message via ZeroMQ. """
+        try:
+            self.post_init()
+            self.loop_body()
+        except RequestLoopEnd:
+            self.logger.info('break from the event loop')
+        except ExecutorFailToLoad:
+            self.logger.error('can not start a executor from %s' % self.args.yaml_path)
+        except MemoryOverHighWatermark:
+            self.logger.error(
+                'memory usage %d GB is above the high-watermark: %d GB' % (used_memory(), self.args.memory_hwm))
+        except UnknownControlCommand as ex:
+            self.logger.error(ex, exc_info=True)
+        except DriverNotInstalled:
+            self.logger.error('no driver is installed to this pea, this pea will do nothing')
+        except NoDriverForRequest:
+            self.logger.error(f'no matched driver for {self.request_type} request, '
+                              f'this pea is either badly configured or it is not configured to handle {self.request_type} request')
+        except KeyboardInterrupt:
+            self.logger.warning('user cancel the process')
+        except zmq.error.ZMQError:
+            self.logger.error('zmqlet can not be initiated')
+        except Exception as ex:
+            self.logger.error('unknown exception: %s' % str(ex), exc_info=True)
+        finally:
+            self.loop_teardown()
+            self.unset_ready()
+            self.is_shutdown.set()
+
+    def check_memory_watermark(self):
+        """Check the memory watermark """
+        if used_memory() > self.args.memory_hwm > 0:
+            raise MemoryOverHighWatermark
+
+    def post_init(self):
+        """Post initializer after the start of the request loop via :func:`run`, so that they can be kept in the same
+        process/thread as the request loop.
+
+        """
+        pass
+
+    def close(self):
+        """Gracefully close this pea and release all resources """
+        if self.is_ready.is_set() and hasattr(self, 'ctrl_addr'):
+            return send_ctrl_message(self.ctrl_addr, jina_pb2.Request.ControlRequest.TERMINATE,
+                                     timeout=self.args.timeout_ctrl)
+
+    @property
+    def status(self):
+        """Send the control signal ``STATUS`` to itself and return the status """
+        if self.is_ready.is_set() and getattr(self, 'ctrl_addr'):
+            return send_ctrl_message(self.ctrl_addr, jina_pb2.Request.ControlRequest.STATUS,
+                                     timeout=self.args.timeout_ctrl)
+
+    def start(self):
+        super().start()
+        if isinstance(self.args, dict):
+            _timeout = getattr(self.args['peas'][0], 'timeout_ready', 5e3) / 1e3
+        else:
+            _timeout = getattr(self.args, 'timeout_ready', 5e3) / 1e3
+
+        if _timeout < 0:
+            _timeout = None
+
+        if self.ready_or_shutdown.wait(_timeout):
+            if self.is_shutdown.is_set():
+                self.logger.critical(f'fail to start {self.__class__} with name {self.name}')
+            return self
+        else:
+            raise TimeoutError(
+                f'{self.__class__} with name {self.name} can not be initialized after {_timeout * 1e3}ms')
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+__copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
+__license__ = "Apache-2.0"
+
+import inspect
+from functools import wraps
+from typing import Callable, List
+
+import ruamel.yaml.constructor
+
+from ..executors.compound import CompoundExecutor
+from ..helper import yaml
+from ..proto import jina_pb2
+
+if False:
+    # fix type-hint complain for sphinx and flake
+    from ..peapods.pea import BasePea
+    from ..executors import AnyExecutor
+    import logging
+
+
+def store_init_kwargs(func):
+    """Mark the args and kwargs of :func:`__init__` later to be stored via :func:`save_config` in YAML """
+
+    @wraps(func)
+    def arg_wrapper(self, *args, **kwargs):
+        if func.__name__ != '__init__':
+            raise TypeError('this decorator should only be used on __init__ method of a driver')
+        taboo = {'self', 'args', 'kwargs'}
+        all_pars = inspect.signature(func).parameters
+        tmp = {k: v.default for k, v in all_pars.items() if k not in taboo}
+        tmp_list = [k for k in all_pars.keys() if k not in taboo]
+        # set args by aligning tmp_list with arg values
+        for k, v in zip(tmp_list, args):
+            tmp[k] = v
+        # set kwargs
+        for k, v in kwargs.items():
+            if k in tmp:
+                tmp[k] = v
+
+        if self.store_args_kwargs:
+            if args: tmp['args'] = args
+            if kwargs: tmp['kwargs'] = {k: v for k, v in kwargs.items() if k not in taboo}
+
+        if hasattr(self, '_init_kwargs_dict'):
+            self._init_kwargs_dict.update(tmp)
+        else:
+            self._init_kwargs_dict = tmp
+        f = func(self, *args, **kwargs)
+        return f
+
+    return arg_wrapper
+
+
+class DriverType(type):
+
+    def __new__(cls, *args, **kwargs):
+        _cls = super().__new__(cls, *args, **kwargs)
+        return cls.register_class(_cls)
+
+    @staticmethod
+    def register_class(cls):
+        reg_cls_set = getattr(cls, '_registered_class', set())
+        if cls.__name__ not in reg_cls_set:
+            # print('reg class: %s' % cls.__name__)
+            cls.__init__ = store_init_kwargs(cls.__init__)
+
+            reg_cls_set.add(cls.__name__)
+            setattr(cls, '_registered_class', reg_cls_set)
+        yaml.register_class(cls)
+        return cls
+
+
+class BaseDriver(metaclass=DriverType):
+    """A :class:`BaseDriver` is a logic unit above the :class:`jina.peapods.pea.BasePea`.
+    It reads the protobuf message, extracts/modifies the required information and then return
+    the message back to :class:`jina.peapods.pea.BasePea`.
+
+    A :class:`BaseDriver` needs to be :attr:`attached` to a :class:`jina.peapods.pea.BasePea` before using. This is done by
+    :func:`attach`. Note that a deserialized :class:`BaseDriver` from file is always unattached.
+    """
+
+    store_args_kwargs = False  #: set this to ``True`` to save ``args`` (in a list) and ``kwargs`` (in a map) in YAML config
+
+    def __init__(self, *args, **kwargs):
+        self.attached = False  #: represent if this driver is attached to a :class:`jina.peapods.pea.BasePea` (& :class:`jina.executors.BaseExecutor`)
+        self.pea = None  # type: 'BasePea'
+
+    def attach(self, pea: 'BasePea', *args, **kwargs):
+        """Attach this driver to a :class:`jina.peapods.pea.BasePea`
+
+        :param pea: the pea to be attached.
+        """
+        self.pea = pea
+        self.attached = True
+
+    @property
+    def req(self) -> 'jina_pb2.Request':
+        """Get the current request, shortcut to ``self.pea.request``"""
+        return self.pea.request
+
+    @property
+    def prev_reqs(self) -> List['jina_pb2.Request']:
+        """Get all previous requests that has the same ``request_id``, shortcut to ``self.pea.prev_requests``
+
+        This returns ``None`` when ``num_part=1``.
+        """
+        return self.pea.prev_requests
+
+    @property
+    def msg(self) -> 'jina_pb2.Message':
+        """Get the current request, shortcut to ``self.pea.message``"""
+        return self.pea.message
+
+    @property
+    def envelope(self) -> 'jina_pb2.Envelope':
+        """Get the current request, shortcut to ``self.pea.message``"""
+        return self.pea.message.envelope
+
+    @property
+    def prev_msgs(self) -> List['jina_pb2.Message']:
+        """Get all previous messages that has the same ``request_id``, shortcut to ``self.pea.prev_messages``
+
+        This returns ``None`` when ``num_part=1``.
+        """
+        return self.pea.prev_messages
+
+    @property
+    def logger(self) -> 'logging.Logger':
+        """Shortcut to ``self.pea.logger``"""
+        return self.pea.logger
+
+    def __call__(self, *args, **kwargs) -> None:
+        raise NotImplementedError
+
+    @staticmethod
+    def _dump_instance_to_yaml(data):
+        # note: we only save non-default property for the sake of clarity
+        a = {k: v for k, v in data._init_kwargs_dict.items()}
+        r = {}
+        if a:
+            r['with'] = a
+        return r
+
+    @classmethod
+    def to_yaml(cls, representer, data):
+        """Required by :mod:`ruamel.yaml.constructor` """
+        tmp = data._dump_instance_to_yaml(data)
+        return representer.represent_mapping('!' + cls.__name__, tmp)
+
+    @classmethod
+    def from_yaml(cls, constructor, node):
+        """Required by :mod:`ruamel.yaml.constructor` """
+        return cls._get_instance_from_yaml(constructor, node)
+
+    @classmethod
+    def _get_instance_from_yaml(cls, constructor, node):
+        data = ruamel.yaml.constructor.SafeConstructor.construct_mapping(
+            constructor, node, deep=True)
+
+        obj = cls(**data.get('with', {}))
+        return obj
+
+    def __eq__(self, other):
+        return self.__class__ == other.__class__
+
+    def __getstate__(self):
+        """Do not save the BasePea, as it would be cross-referencing. In other words, a deserialized :class:`BaseDriver` from
+        file is always unattached. """
+        d = dict(self.__dict__)
+        if 'pea' in d:
+            del d['pea']
+        d['attached'] = False
+        return d
+
+
+class BaseExecutableDriver(BaseDriver):
+    """A :class:`BaseExecutableDriver` is an intermediate logic unit between the :class:`jina.peapods.pea.BasePea` and :class:`jina.executors.BaseExecutor`
+        It reads the protobuf message, extracts/modifies the required information and then sends to the :class:`jina.executors.BaseExecutor`,
+        finally it returns the message back to :class:`jina.peapods.pea.BasePea`.
+
+        A :class:`BaseExecutableDriver` needs to be :attr:`attached` to a :class:`jina.peapods.pea.BasePea` and :class:`jina.executors.BaseExecutor` before using.
+        This is done by :func:`attach`. Note that a deserialized :class:`BaseDriver` from file is always unattached.
+    """
+
+    def __init__(self, executor: str = None, method: str = None, *args, **kwargs):
+        """ Initialize a :class:`BaseExecutableDriver`
+
+        :param executor: the name of the sub-executor, only necessary when :class:`jina.executors.compound.CompoundExecutor` is used
+        :param method: the function name of the executor that the driver feeds to
+        """
+        super().__init__(*args, **kwargs)
+        self._executor_name = executor
+        self._method_name = method
+        self._exec = None
+        self._exec_fn = None
+
+    @property
+    def exec(self) -> 'AnyExecutor':
+        """the executor that attached """
+        return self._exec
+
+    @property
+    def exec_fn(self) -> Callable:
+        """the function of :func:`jina.executors.BaseExecutor` to call """
+        return self._exec_fn
+
+    def attach(self, executor: 'AnyExecutor', *args, **kwargs):
+        """Attach the driver to a :class:`jina.executors.BaseExecutor`"""
+        super().attach(*args, **kwargs)
+        if self._executor_name and isinstance(executor, CompoundExecutor):
+            if self._executor_name in executor:
+                self._exec = executor[self._executor_name]
+            else:
+                for c in executor.components:
+                    if any(t.__name__ == self._executor_name for t in type.mro(c.__class__)):
+                        self._exec = c
+                        break
+            if self._exec is None:
+                self.logger.critical(f'fail to attach the driver to {executor}, '
+                                     f'no executor is named or typed as {self._executor_name}')
+        else:
+            self._exec = executor
+
+        if self._method_name:
+            self._exec_fn = getattr(self.exec, self._method_name)
+
+    def __getstate__(self):
+        """Do not save the executor and executor function, as it would be cross-referencing and unserializable.
+        In other words, a deserialized :class:`BaseExecutableDriver` from file is always unattached. """
+        d = super().__getstate__()
+        if '_exec' in d:
+            del d['_exec']
+        if '_exec_fn' in d:
+            del d['_exec_fn']
+        return d
+__copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
+__license__ = "Apache-2.0"
+
+import os
+import pickle
+import re
+import tempfile
+import uuid
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Dict, Any, Union, TypeVar, Type, TextIO, List
+
+import ruamel.yaml.constructor
+from ruamel.yaml import StringIO
+
+from .decorators import as_train_method, as_update_method, store_init_kwargs
+from .metas import get_default_metas, fill_metas_with_defaults
+from ..excepts import EmptyExecutorYAML, BadWorkspace, BadPersistantFile, NoDriverForRequest, UnattachedDriver
+from ..helper import yaml, PathImporter, expand_dict, expand_env_var, valid_yaml_path
+from ..logging.base import get_logger
+from ..logging.profile import TimeContext
+
+if False:
+    from ..drivers import BaseDriver
+
+__all__ = ['BaseExecutor', 'AnyExecutor', 'ExecutorType']
+
+AnyExecutor = TypeVar('AnyExecutor', bound='BaseExecutor')
+
+# some variables may be self-referred and they must be resolved at here
+_ref_desolve_map = SimpleNamespace()
+_ref_desolve_map.__dict__['metas'] = SimpleNamespace()
+_ref_desolve_map.__dict__['metas'].__dict__['replica_id'] = 0
+_ref_desolve_map.__dict__['metas'].__dict__['separated_workspace'] = False
+
+
+class ExecutorType(type):
+
+    def __new__(cls, *args, **kwargs):
+        _cls = super().__new__(cls, *args, **kwargs)
+        return cls.register_class(_cls)
+
+    def __call__(cls, *args, **kwargs):
+        # do _preload_package
+        getattr(cls, 'pre_init', lambda *x: None)()
+
+        m = kwargs.pop('metas') if 'metas' in kwargs else {}
+        r = kwargs.pop('requests') if 'requests' in kwargs else {}
+
+        obj = type.__call__(cls, *args, **kwargs)
+
+        # set attribute with priority
+        # metas in YAML > class attribute > default_jina_config
+        # jina_config = expand_dict(jina_config)
+
+        getattr(obj, '_post_init_wrapper', lambda *x: None)(m, r)
+        return obj
+
+    @staticmethod
+    def register_class(cls):
+        prof_funcs = ['train', 'encode', 'add', 'query', 'craft', 'score']
+        update_funcs = ['train', 'add']
+        train_funcs = ['train']
+
+        def wrap_func(func_lst, wrapper):
+            for f_name in func_lst:
+                if hasattr(cls, f_name):
+                    setattr(cls, f_name, wrapper(getattr(cls, f_name)))
+
+        reg_cls_set = getattr(cls, '_registered_class', set())
+        if cls.__name__ not in reg_cls_set:
+            # print('reg class: %s' % cls.__name__)
+            cls.__init__ = store_init_kwargs(cls.__init__)
+            # if 'JINA_PROFILING' in os.environ:
+            #     wrap_func(prof_funcs, profiling)
+
+            wrap_func(train_funcs, as_train_method)
+            wrap_func(update_funcs, as_update_method)
+
+            reg_cls_set.add(cls.__name__)
+            setattr(cls, '_registered_class', reg_cls_set)
+        yaml.register_class(cls)
+        return cls
+
+
+class BaseExecutor(metaclass=ExecutorType):
+    """
+    The base class of the executor, can be used to build encoder, indexer, etc.
+
+    Any executor inherited from :class:`BaseExecutor` always has the **meta** defined in :mod:`jina.executors.metas.defaults`.
+
+    All arguments in the :func:`__init__` can be specified with a ``with`` map in the YAML config. Example:
+
+    .. highlight:: python
+    .. code-block:: python
+
+        class MyAwesomeExecutor:
+            def __init__(awesomeness = 5):
+                pass
+
+    is equal to
+
+    .. highlight:: yaml
+    .. code-block:: yaml
+
+        !MyAwesomeExecutor
+        with:
+            awesomeness: 5
+
+    To use an executor in a :class:`jina.peapods.pea.BasePea` or :class:`jina.peapods.pod.BasePod`,
+    a proper :class:`jina.drivers.Driver` is required. This is because the
+    executor is *NOT* protobuf-aware and has no access to the key-values in the protobuf message.
+
+    Different executor may require different :class:`Driver` with
+    proper :mod:`jina.drivers.handlers`, :mod:`jina.drivers.hooks` installed.
+
+    .. seealso::
+        Methods of the :class:`BaseExecutor` can be decorated via :mod:`jina.executors.decorators`.
+
+    .. seealso::
+        Meta fields :mod:`jina.executors.metas.defaults`.
+
+    """
+    store_args_kwargs = False  #: set this to ``True`` to save ``args`` (in a list) and ``kwargs`` (in a map) in YAML config
+
+    def __init__(self, *args, **kwargs):
+        self.logger = get_logger(self.__class__.__name__)
+        self._snapshot_files = []
+        self._post_init_vars = set()
+        self._last_snapshot_ts = datetime.now()
+        self._drivers = {}  # type: Dict[str, List['BaseDriver']]
+        self._attached_pea = None
+
+    def _post_init_wrapper(self, _metas: Dict = None, _requests: Dict = None, fill_in_metas: bool = True):
+        with TimeContext('post initiating, this may take some time', self.logger):
+            if fill_in_metas:
+                if not _metas:
+                    _metas = get_default_metas()
+
+                if not _requests:
+                    from ..executors.requests import get_default_reqs
+                    _requests = get_default_reqs(type.mro(self.__class__))
+
+                self._fill_metas(_metas)
+                self._fill_requests(_requests)
+
+            _before = set(list(vars(self).keys()))
+            self.post_init()
+            self._post_init_vars = {k for k in vars(self) if k not in _before}
+
+    def _fill_requests(self, _requests):
+
+        if _requests and 'on' in _requests and isinstance(_requests['on'], dict):
+            # if control request is forget in YAML, then fill it
+            if 'ControlRequest' not in _requests['on']:
+                from ..drivers.control import ControlReqDriver
+                _requests['on']['ControlRequest'] = [ControlReqDriver()]
+
+            for req_type, drivers in _requests['on'].items():
+                if isinstance(req_type, str):
+                    req_type = [req_type]
+                for r in req_type:
+                    if r not in self._drivers:
+                        self._drivers[r] = list()
+                    if self._drivers[r] != drivers:
+                        self._drivers[r].extend(drivers)
+
+    def _fill_metas(self, _metas):
+        unresolved_attr = False
+        # set self values filtered by those non-exist, and non-expandable
+        for k, v in _metas.items():
+            if not hasattr(self, k):
+                if isinstance(v, str):
+                    if not (re.match(r'{.*?}', v) or re.match(r'\$.*\b', v)):
+                        setattr(self, k, v)
+                    else:
+                        unresolved_attr = True
+                else:
+                    setattr(self, k, v)
+        if not getattr(self, 'name', None):
+            _id = str(uuid.uuid4()).split('-')[0]
+            _name = '%s-%s' % (self.__class__.__name__, _id)
+            if self.warn_unnamed:
+                self.logger.warning(
+                    'this executor is not named, i will call it "%s". '
+                    'naming is important as it provides an unique identifier when '
+                    'persisting this executor on disk.' % _name)
+            setattr(self, 'name', _name)
+        if unresolved_attr:
+            _tmp = vars(self)
+            _tmp['metas'] = _metas
+            new_metas = expand_dict(_tmp)['metas']
+
+            # set self values filtered by those non-exist, and non-expandable
+            for k, v in new_metas.items():
+                if not hasattr(self, k):
+                    if isinstance(v, str) and (re.match(r'{.*?}', v) or re.match(r'\$.*\b', v)):
+                        v = expand_env_var(v.format(root=_ref_desolve_map, this=_ref_desolve_map))
+                    if isinstance(v, str):
+                        if not (re.match(r'{.*?}', v) or re.match(r'\$.*\b', v)):
+                            setattr(self, k, v)
+                        else:
+                            raise ValueError('%s=%s is not expandable or badly referred' % (k, v))
+                    else:
+                        setattr(self, k, v)
+
+    def post_init(self):
+        """
+        Initialize class attributes/members that can/should not be (de)serialized in standard way.
+
+        Examples:
+
+            - deep learning models
+            - index files
+            - numpy arrays
+
+        .. warning::
+            All class members created here will NOT be serialized when calling :func:`save`. Therefore if you
+            want to store them, please override the :func:`__getstate__`.
+        """
+        pass
+
+    @classmethod
+    def pre_init(cls):
+        """This function is called before the object initiating (i.e. :func:`__call__`)
+
+        Packages and environment variables can be set and load here.
+        """
+        pass
+
+    @property
+    def save_abspath(self) -> str:
+        """Get the file path of the binary serialized object
+
+        The file name ends with `.bin`.
+        """
+        return self.get_file_from_workspace('%s.bin' % self.name)
+
+    @property
+    def config_abspath(self) -> str:
+        """Get the file path of the YAML config
+
+        The file name ends with `.yml`.
+        """
+        return self.get_file_from_workspace('%s.yml' % self.name)
+
+    @property
+    def current_workspace(self) -> str:
+        """ Get the path of the current workspace.
+
+        :return: if ``separated_workspace`` is set to ``False`` then ``metas.workspace`` is returned,
+                otherwise the ``metas.replica_workspace`` is returned
+        """
+        work_dir = self.replica_workspace if self.separated_workspace else self.workspace  # type: str
+        return work_dir
+
+    def get_file_from_workspace(self, name: str) -> str:
+        """Get a usable file path under the current workspace
+
+        :param name: the name of the file
+
+        :return depending on ``metas.separated_workspace`` the file could be located in ``metas.workspace`` or ``metas.replica_workspace``
+        """
+        Path(self.current_workspace).mkdir(parents=True, exist_ok=True)
+        return os.path.join(self.current_workspace, name)
+
+    def __getstate__(self):
+        d = dict(self.__dict__)
+        del d['logger']
+        for k in self._post_init_vars:
+            del d[k]
+        return d
+
+    def __setstate__(self, d):
+        self.__dict__.update(d)
+        self.logger = get_logger(self.__class__.__name__)
+        try:
+            self._post_init_wrapper(fill_in_metas=False)
+        except ImportError as ex:
+            self.logger.warning('ImportError is often caused by a missing component, '
+                                'which often can be solved by "pip install" relevant package. %s' % ex, exc_info=True)
+
+    def train(self, *args, **kwargs):
+        """
+        Train this executor, need to be overrided
+        """
+        pass
+
+    def touch(self):
+        """Touch the executor and change ``is_updated`` to ``True`` so that one can call :func:`save`. """
+        self.is_updated = True
+
+    def save(self, filename: str = None) -> bool:
+        """
+        Persist data of this executor to the :attr:`workspace` (or :attr:`replica_workspace`). The data could be
+        a file or collection of files produced/used during an executor run.
+
+        These are some of the common data that you might want to persist:
+
+            - binary dump/pickle of the executor
+            - the indexed files
+            - (pre)trained models
+
+        .. warning::
+            All class members created here will NOT be serialized when calling :func:`save`. Therefore if you
+            want to store them, please implement the :func:`__getstate__`.
+
+        It uses ``pickle`` for dumping. For members/attributes that are not valid or not efficient for ``pickle``, you
+        need to implement their own persistence strategy in the :func:`__getstate__`.
+
+        :param filename: file path of the serialized file, if not given then :attr:`save_abspath` is used
+        :return: successfully persisted or not
+        """
+        if not self.is_updated:
+            self.logger.info(f'no update since {self._last_snapshot_ts:%Y-%m-%d %H:%M:%S%z}, will not save. '
+                             'If you really want to save it, call "touch()" before "save()" to force saving')
+            return False
+
+        self.is_updated = False
+        f = filename or self.save_abspath
+        if not f:
+            f = tempfile.NamedTemporaryFile('w', delete=False, dir=os.environ.get('JINA_EXECUTOR_WORKDIR', None)).name
+
+        if self.max_snapshot > 0 and os.path.exists(f):
+            bak_f = f + '.snapshot-%s' % (self._last_snapshot_ts.strftime('%Y%m%d%H%M%S') or 'NA')
+            os.rename(f, bak_f)
+            self._snapshot_files.append(bak_f)
+            if len(self._snapshot_files) > self.max_snapshot:
+                d_f = self._snapshot_files.pop(0)
+                if os.path.exists(d_f):
+                    os.remove(d_f)
+
+        with open(f, 'wb') as fp:
+            pickle.dump(self, fp)
+            self._last_snapshot_ts = datetime.now()
+
+        self.logger.success('artifacts of this executor (%s) is persisted to %s' % (self.name, f))
+        return True
+
+    def save_config(self, filename: str = None) -> bool:
+        """
+        Serialize the object to a yaml file
+
+        :param filename: file path of the yaml file, if not given then :attr:`config_abspath` is used
+        :return: successfully dumped or not
+        """
+        _updated, self.is_updated = self.is_updated, False
+        f = filename or self.config_abspath
+        if not f:
+            f = tempfile.NamedTemporaryFile('w', delete=False, dir=os.environ.get('JINA_EXECUTOR_WORKDIR', None)).name
+        with open(f, 'w', encoding='utf8') as fp:
+            yaml.dump(self, fp)
+        self.logger.info('executor\'s yaml config is save to %s' % f)
+
+        self.is_updated = _updated
+        return True
+
+    @classmethod
+    def load_config(cls: Type[AnyExecutor], filename: Union[str, TextIO], separated_workspace: bool = False,
+                    replica_id: int = 0) -> AnyExecutor:
+        """Build an executor from a YAML file.
+
+        :param filename: the file path of the YAML file or a ``TextIO`` stream to be loaded from
+        :param separated_workspace: the dump and data files associated to this executor will be stored separately for
+                each replica, which will be indexed by the ``replica_id``
+        :param replica_id: the id of the storage of this replica, only effective when ``separated_workspace=True``
+        :return: an executor object
+        """
+        if not filename: raise FileNotFoundError
+        filename = valid_yaml_path(filename)
+        # first scan, find if external modules are specified
+        with (open(filename, encoding='utf8') if isinstance(filename, str) else filename) as fp:
+            # ignore all lines start with ! because they could trigger the deserialization of that class
+            safe_yml = '\n'.join(v if not re.match(r'^[\s-]*?!\b', v) else v.replace('!', '__tag: ') for v in fp)
+            tmp = yaml.load(safe_yml)
+            if tmp:
+                if 'metas' not in tmp:
+                    tmp['metas'] = {}
+                tmp = fill_metas_with_defaults(tmp)
+
+                if 'py_modules' in tmp['metas'] and tmp['metas']['py_modules']:
+                    mod = tmp['metas']['py_modules']
+
+                    if isinstance(mod, str):
+                        mod = [mod]
+
+                    if isinstance(mod, list):
+                        mod = [m if os.path.isabs(m) else os.path.join(os.path.dirname(filename), m) for m in mod]
+                        PathImporter.add_modules(*mod)
+                    else:
+                        raise TypeError('%r is not acceptable, only str or list are acceptable' % type(mod))
+
+                tmp['metas']['separated_workspace'] = separated_workspace
+                tmp['metas']['replica_id'] = replica_id
+
+            else:
+                raise EmptyExecutorYAML('%s is empty? nothing to read from there' % filename)
+
+            tmp = expand_dict(tmp)
+            stream = StringIO()
+            yaml.dump(tmp, stream)
+            tmp_s = stream.getvalue().strip().replace('__tag: ', '!')
+            return yaml.load(tmp_s)
+
+    @staticmethod
+    def load(filename: str = None) -> AnyExecutor:
+        """Build an executor from a binary file
+
+        :param filename: the file path of the binary serialized file
+        :return: an executor object
+
+        It uses ``pickle`` for loading.
+        """
+        if not filename: raise FileNotFoundError
+        try:
+            with open(filename, 'rb') as fp:
+                return pickle.load(fp)
+        except EOFError:
+            raise BadPersistantFile('broken file %s can not be loaded' % filename)
+
+    def close(self):
+        """
+        Release the resources as executor is destroyed, need to be overrided
+        """
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    @classmethod
+    def to_yaml(cls, representer, data):
+        """Required by :mod:`ruamel.yaml.constructor` """
+        tmp = data._dump_instance_to_yaml(data)
+        if getattr(data, '_drivers'):
+            tmp['requests'] = {'on': data._drivers}
+        return representer.represent_mapping('!' + cls.__name__, tmp)
+
+    @classmethod
+    def from_yaml(cls, constructor, node):
+        """Required by :mod:`ruamel.yaml.constructor` """
+        return cls._get_instance_from_yaml(constructor, node)[0]
+
+    @classmethod
+    def _get_instance_from_yaml(cls, constructor, node):
+        data = ruamel.yaml.constructor.SafeConstructor.construct_mapping(
+            constructor, node, deep=True)
+
+        _meta_config = get_default_metas()
+        _meta_config.update(data.get('metas', {}))
+        if _meta_config:
+            data['metas'] = _meta_config
+
+        dump_path = cls._get_dump_path_from_config(data.get('metas', {}))
+        load_from_dump = False
+        if dump_path:
+            obj = cls.load(dump_path)
+            obj.logger.success('restore %s from %s' % (cls.__name__, dump_path))
+            load_from_dump = True
+        else:
+            cls.init_from_yaml = True
+
+            if cls.store_args_kwargs:
+                p = data.get('with', {})  # type: Dict[str, Any]
+                a = p.pop('args') if 'args' in p else ()
+                k = p.pop('kwargs') if 'kwargs' in p else {}
+                # maybe there are some hanging kwargs in "parameters"
+                # tmp_a = (expand_env_var(v) for v in a)
+                # tmp_p = {kk: expand_env_var(vv) for kk, vv in {**k, **p}.items()}
+                tmp_a = a
+                tmp_p = {kk: vv for kk, vv in {**k, **p}.items()}
+                obj = cls(*tmp_a, **tmp_p, metas=data.get('metas', {}), requests=data.get('requests', {}))
+            else:
+                # tmp_p = {kk: expand_env_var(vv) for kk, vv in data.get('with', {}).items()}
+                obj = cls(**data.get('with', {}), metas=data.get('metas', {}), requests=data.get('requests', {}))
+
+            obj.logger.success(f'successfully built {cls.__name__} from a yaml config')
+            cls.init_from_yaml = False
+
+        # if node.tag in {'!CompoundExecutor'}:
+        #     os.environ['JINA_WARN_UNNAMED'] = 'YES'
+
+        if not _meta_config:
+            obj.logger.warning(
+                '"metas" config is not found in this yaml file, '
+                'this map is important as it provides an unique identifier when '
+                'persisting the executor on disk.')
+
+        return obj, data, load_from_dump
+
+    @staticmethod
+    def _get_dump_path_from_config(meta_config: Dict):
+        if 'name' in meta_config:
+            if meta_config.get('separated_workspace', False) is True:
+                if 'replica_id' in meta_config and isinstance(meta_config['replica_id'], int):
+                    work_dir = meta_config['replica_workspace']
+                    dump_path = os.path.join(work_dir, '%s.%s' % (meta_config['name'], 'bin'))
+                    if os.path.exists(dump_path):
+                        return dump_path
+                else:
+                    raise BadWorkspace('separated_workspace=True but replica_id is unset or set to a bad value')
+            else:
+                dump_path = os.path.join(meta_config.get('workspace', os.getcwd()),
+                                         '%s.%s' % (meta_config['name'], 'bin'))
+                if os.path.exists(dump_path):
+                    return dump_path
+
+    @staticmethod
+    def _dump_instance_to_yaml(data):
+        # note: we only save non-default property for the sake of clarity
+        _defaults = get_default_metas()
+        p = {k: getattr(data, k) for k, v in _defaults.items() if getattr(data, k) != v}
+        a = {k: v for k, v in data._init_kwargs_dict.items() if k not in _defaults}
+        r = {}
+        if a:
+            r['with'] = a
+        if p:
+            r['metas'] = p
+        return r
+
+    def attach(self, *args, **kwargs):
+        """Attach this executor to a :class:`jina.peapods.pea.BasePea`.
+
+        This is called inside the initializing of a :class:`jina.peapods.pea.BasePea`.
+        """
+        for v in self._drivers.values():
+            for d in v:
+                d.attach(executor=self, *args, **kwargs)
+
+    def __call__(self, req_type, *args, **kwargs):
+        if req_type in self._drivers:
+            for d in self._drivers[req_type]:
+                if d.attached:
+                    d()
+                else:
+                    raise UnattachedDriver(d)
+        else:
+            raise NoDriverForRequest(req_type)

@@ -3,7 +3,7 @@ import os
 
 def extract_data_to_files(project_name, path='PATH_TO_PROJECTS'):
     datalist = []
-    all_data_file = open('PATH_TO_PROJECTS' + project_name + '_all_data.txt', 'w')
+    all_data_file = open(path + project_name + '_all_data.txt', 'w')
     for path, subdirs, files in os.walk(os.path.join(path, project_name + '-master')):
         for name in files:
             _, file_extension = os.path.splitext(name)
