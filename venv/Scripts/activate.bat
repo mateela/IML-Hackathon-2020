@@ -8,7 +8,7 @@ if defined _OLD_CODEPAGE (
     "%SystemRoot%\System32\chcp.com" 65001 > nul
 )
 
-set VIRTUAL_ENV=C:\Guy\University\second_year\IML\IML_Hackathon\venv
+set VIRTUAL_ENV=C:\Users\מתן אלישר\Documents\לימודים\מדמח\שנה ב\IML\IML_Hackathon\venv
 
 if not defined PROMPT set PROMPT=$P$G
 

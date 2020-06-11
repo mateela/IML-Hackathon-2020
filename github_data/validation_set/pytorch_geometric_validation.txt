@@ -1,0 +1,4575 @@
+    def __init__(self, in_channels, out_channels, improved=False, cached=False,
+                 bias=True, normalize=True, **kwargs):
+        super(GCNConv, self).__init__(aggr='add', **kwargs)
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.improved = improved
+        self.cached = cached
+        self.normalize = normalize
+
+        self.weight = Parameter(torch.Tensor(in_channels, out_channels))
+
+        if bias:
+            self.bias = Parameter(torch.Tensor(out_channels))
+        else:
+            self.register_parameter('bias', None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        glorot(self.weight)
+        zeros(self.bias)
+        self.cached_result = None
+        self.cached_num_edges = None
+
+    @staticmethod
+    def norm(edge_index, num_nodes, edge_weight=None, improved=False,
+             dtype=None):
+        if edge_weight is None:
+            edge_weight = torch.ones((edge_index.size(1), ), dtype=dtype,
+                                     device=edge_index.device)
+
+        fill_value = 1 if not improved else 2
+        edge_index, edge_weight = add_remaining_self_loops(
+            edge_index, edge_weight, fill_value, num_nodes)
+
+        row, col = edge_index
+        deg = scatter_add(edge_weight, row, dim=0, dim_size=num_nodes)
+        deg_inv_sqrt = deg.pow(-0.5)
+        deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
+
+        return edge_index, deg_inv_sqrt[row] * edge_weight * deg_inv_sqrt[col]
+
+    def forward(self, x, edge_index, edge_weight=None):
+        """"""
+        x = torch.matmul(x, self.weight)
+
+        if self.cached and self.cached_result is not None:
+            if edge_index.size(1) != self.cached_num_edges:
+                raise RuntimeError(
+                    'Cached {} number of edges, but found {}. Please '
+                    'disable the caching behavior of this layer by removing '
+                    'the `cached=True` argument in its constructor.'.format(
+                        self.cached_num_edges, edge_index.size(1)))
+
+        if not self.cached or self.cached_result is None:
+            self.cached_num_edges = edge_index.size(1)
+            if self.normalize:
+                edge_index, norm = self.norm(edge_index, x.size(
+                    self.node_dim), edge_weight, self.improved, x.dtype)
+            else:
+                norm = edge_weight
+            self.cached_result = edge_index, norm
+
+        edge_index, norm = self.cached_result
+
+        return self.propagate(edge_index, x=x, norm=norm)
+
+    def message(self, x_j, norm):
+        return norm.view(-1, 1) * x_j if norm is not None else x_j
+
+    def update(self, aggr_out):
+        if self.bias is not None:
+            aggr_out = aggr_out + self.bias
+        return aggr_out
+
+    def __repr__(self):
+        return '{}({}, {})'.format(self.__class__.__name__, self.in_channels,
+                                   self.out_channels)
+from torch_geometric.nn.conv import MessagePassing, GCNConv
+
+
+class APPNP(MessagePassing):
+    r"""The approximate personalized propagation of neural predictions layer
+    from the `"Predict then Propagate: Graph Neural Networks meet Personalized
+    PageRank" <https://arxiv.org/abs/1810.05997>`_ paper
+
+    .. math::
+        \mathbf{X}^{(0)} &= \mathbf{X}
+
+        \mathbf{X}^{(k)} &= (1 - \alpha) \mathbf{\hat{D}}^{-1/2}
+        \mathbf{\hat{A}} \mathbf{\hat{D}}^{-1/2} \mathbf{X}^{(k-1)} + \alpha
+        \mathbf{X}^{(0)}
+
+        \mathbf{X}^{\prime} &= \mathbf{X}^{(K)},
+
+    where :math:`\mathbf{\hat{A}} = \mathbf{A} + \mathbf{I}` denotes the
+    adjacency matrix with inserted self-loops and
+    :math:`\hat{D}_{ii} = \sum_{j=0} \hat{A}_{ij}` its diagonal degree matrix.
+
+    Args:
+        K (int): Number of iterations :math:`K`.
+        alpha (float): Teleport probability :math:`\alpha`.
+        bias (bool, optional): If set to :obj:`False`, the layer will not learn
+            an additive bias. (default: :obj:`True`)
+        **kwargs (optional): Additional arguments of
+            :class:`torch_geometric.nn.conv.MessagePassing`.
+    """
+    def __init__(self, K, alpha, bias=True, **kwargs):
+        super(APPNP, self).__init__(aggr='add', **kwargs)
+        self.K = K
+        self.alpha = alpha
+
+    def forward(self, x, edge_index, edge_weight=None):
+        """"""
+        edge_index, norm = GCNConv.norm(edge_index, x.size(self.node_dim),
+                                        edge_weight, dtype=x.dtype)
+
+        hidden = x
+        for k in range(self.K):
+            x = self.propagate(edge_index, x=x, norm=norm)
+            x = x * (1 - self.alpha)
+            x = x + self.alpha * hidden
+
+        return x
+
+    def message(self, x_j, norm):
+        return norm.view(-1, 1) * x_j
+
+    def __repr__(self):
+        return '{}(K={}, alpha={})'.format(self.__class__.__name__, self.K,
+                                           self.alpha)
+import torch
+from torch.nn import Parameter
+from torch_geometric.nn.conv import MessagePassing
+
+from ..inits import zeros, glorot
+
+EPS = 1e-15
+
+
+class GMMConv(MessagePassing):
+    r"""The gaussian mixture model convolutional operator from the `"Geometric
+    Deep Learning on Graphs and Manifolds using Mixture Model CNNs"
+    <https://arxiv.org/abs/1611.08402>`_ paper
+
+    .. math::
+        \mathbf{x}^{\prime}_i = \frac{1}{|\mathcal{N}(i)|}
+        \sum_{j \in \mathcal{N}(i)} \frac{1}{K} \sum_{k=1}^K
+        \mathbf{w}_k(\mathbf{e}_{i,j}) \odot \mathbf{\Theta}_k \mathbf{x}_j,
+
+    where
+
+    .. math::
+        \mathbf{w}_k(\mathbf{e}) = \exp \left( -\frac{1}{2} {\left(
+        \mathbf{e} - \mathbf{\mu}_k \right)}^{\top} \Sigma_k^{-1}
+        \left( \mathbf{e} - \mathbf{\mu}_k \right) \right)
+
+    denotes a weighting function based on trainable mean vector
+    :math:`\mathbf{\mu}_k` and diagonal covariance matrix
+    :math:`\mathbf{\Sigma}_k`.
+
+    Args:
+        in_channels (int): Size of each input sample.
+        out_channels (int): Size of each output sample.
+        dim (int): Pseudo-coordinate dimensionality.
+        kernel_size (int): Number of kernels :math:`K`.
+        separate_gaussians (bool, optional): If set to :obj:`True`, will
+            learn separate GMMs for every pair of input and output channel,
+            inspired by traditional CNNs. (default: :obj:`False`)
+        aggr (string, optional): The aggregation operator to use
+            (:obj:`"add"`, :obj:`"mean"`, :obj:`"max"`).
+            (default: :obj:`"mean"`)
+        root_weight (bool, optional): If set to :obj:`False`, the layer will
+            not add transformed root node features to the output.
+            (default: :obj:`True`)
+        bias (bool, optional): If set to :obj:`False`, the layer will not learn
+            an additive bias. (default: :obj:`True`)
+        **kwargs (optional): Additional arguments of
+            :class:`torch_geometric.nn.conv.MessagePassing`.
+    """
+
+    def __init__(self, in_channels, out_channels, dim, kernel_size,
+                 separate_gaussians=False, aggr='mean', root_weight=True,
+                 bias=True, **kwargs):
+        super(GMMConv, self).__init__(aggr=aggr, **kwargs)
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.dim = dim
+        self.kernel_size = kernel_size
+        self.separate_gaussians = separate_gaussians
+
+        self.g = Parameter(
+            torch.Tensor(in_channels, out_channels * kernel_size))
+
+        if not self.separate_gaussians:
+            self.mu = Parameter(torch.Tensor(kernel_size, dim))
+            self.sigma = Parameter(torch.Tensor(kernel_size, dim))
+        else:
+            self.mu = Parameter(
+                torch.Tensor(in_channels, out_channels, kernel_size, dim))
+            self.sigma = Parameter(
+                torch.Tensor(in_channels, out_channels, kernel_size, dim))
+
+        if root_weight:
+            self.root = Parameter(torch.Tensor(in_channels, out_channels))
+        else:
+            self.register_parameter('root', None)
+
+        if bias:
+            self.bias = Parameter(torch.Tensor(out_channels))
+        else:
+            self.register_parameter('bias', None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        glorot(self.g)
+        glorot(self.mu)
+        glorot(self.sigma)
+        glorot(self.root)
+        zeros(self.bias)
+
+    def forward(self, x, edge_index, pseudo):
+        """"""
+        x = x.unsqueeze(-1) if x.dim() == 1 else x
+        pseudo = pseudo.unsqueeze(-1) if pseudo.dim() == 1 else pseudo
+
+        N, K, M = x.size(0), self.kernel_size, self.out_channels
+
+        if not self.separate_gaussians:
+            out = torch.matmul(x, self.g).view(N, K, M)
+            out = self.propagate(edge_index, x=out, pseudo=pseudo)
+        else:
+            out = self.propagate(edge_index, x=x, pseudo=pseudo)
+
+        if self.root is not None:
+            out = out + torch.matmul(x, self.root)
+
+        if self.bias is not None:
+            out = out + self.bias
+
+        return out
+
+    def message(self, x_j, pseudo):
+        F, M = self.in_channels, self.out_channels
+        (E, D), K = pseudo.size(), self.kernel_size
+
+        if not self.separate_gaussians:
+            gaussian = -0.5 * (pseudo.view(E, 1, D) -
+                               self.mu.view(1, K, D)).pow(2)
+            gaussian = gaussian / (EPS + self.sigma.view(1, K, D).pow(2))
+            gaussian = torch.exp(gaussian.sum(dim=-1))  # [E, K]
+
+            return (x_j.view(E, K, M) * gaussian.view(E, K, 1)).sum(dim=-2)
+
+        else:
+            gaussian = -0.5 * (pseudo.view(E, 1, 1, 1, D) -
+                               self.mu.view(1, F, M, K, D)).pow(2)
+            gaussian = gaussian / (EPS + self.sigma.view(1, F, M, K, D).pow(2))
+            gaussian = torch.exp(gaussian.sum(dim=-1))  # [E, F, M, K]
+
+            gaussian = gaussian * self.g.view(1, F, M, K)
+            gaussian = gaussian.sum(dim=-1)  # [E, F, M]
+
+            return (x_j.view(E, F, 1) * gaussian).sum(dim=-2)  # [E, M]
+
+    def __repr__(self):
+        return '{}({}, {})'.format(self.__class__.__name__, self.in_channels,
+                                   self.out_channels)
+from torch_sparse import coalesce
+from torch_scatter import scatter_mean
+from torch_geometric.utils import remove_self_loops
+
+
+def pool_edge(cluster, edge_index, edge_attr=None):
+    num_nodes = cluster.size(0)
+    edge_index = cluster[edge_index.view(-1)].view(2, -1)
+    edge_index, edge_attr = remove_self_loops(edge_index, edge_attr)
+    if edge_index.numel() > 0:
+        edge_index, edge_attr = coalesce(edge_index, edge_attr, num_nodes,
+                                         num_nodes)
+    return edge_index, edge_attr
+
+
+def pool_batch(perm, batch):
+    return batch[perm]
+
+
+def pool_pos(cluster, pos):
+    return scatter_mean(pos, cluster, dim=0)
+try:
+    from torch_cluster import graclus_cluster
+except ImportError:
+    graclus_cluster = None
+
+
+def graclus(edge_index, weight=None, num_nodes=None):
+    r"""A greedy clustering algorithm from the `"Weighted Graph Cuts without
+    Eigenvectors: A Multilevel Approach" <http://www.cs.utexas.edu/users/
+    inderjit/public_papers/multilevel_pami.pdf>`_ paper of picking an unmarked
+    vertex and matching it with one of its unmarked neighbors (that maximizes
+    its edge weight).
+    The GPU algoithm is adapted from the `"A GPU Algorithm for Greedy Graph
+    Matching" <http://www.staff.science.uu.nl/~bisse101/Articles/match12.pdf>`_
+    paper.
+
+    Args:
+        edge_index (LongTensor): The edge indices.
+        weight (Tensor, optional): One-dimensional edge weights.
+            (default: :obj:`None`)
+        num_nodes (int, optional): The number of nodes, *i.e.*
+            :obj:`max_val + 1` of :attr:`edge_index`. (default: :obj:`None`)
+
+    :rtype: :class:`LongTensor`
+    """
+
+    if graclus_cluster is None:
+        raise ImportError('`graclus` requires `torch-cluster`.')
+
+    row, col = edge_index
+    return graclus_cluster(row, col, weight, num_nodes)
+import torch
+import torch.nn.functional as F
+from torch.nn import Linear
+from torch_scatter import scatter
+from torch_sparse import SparseTensor
+
+from torch_geometric.nn import LEConv
+from torch_geometric.utils import softmax
+from torch_geometric.nn.pool.topk_pool import topk
+from torch_geometric.utils import add_remaining_self_loops
+
+
+class ASAPooling(torch.nn.Module):
+    r"""The Adaptive Structure Aware Pooling operator from the
+    `"ASAP: Adaptive Structure Aware Pooling for Learning Hierarchical
+    Graph Representations" <https://arxiv.org/abs/1911.07979>`_ paper.
+
+    Args:
+        in_channels (int): Size of each input sample.
+        ratio (float, optional): Graph pooling ratio, which is used to compute
+            :math:`k = \lceil \mathrm{ratio} \cdot N \rceil`.
+            (default: :obj:`0.5`)
+        GNN (torch.nn.Module, optional): A graph neural network layer for
+            using intra-cluster properties.
+            Especially helpful for graphs with higher degree of neighborhood
+            (one of :class:`torch_geometric.nn.conv.GraphConv`,
+            :class:`torch_geometric.nn.conv.GCNConv` or
+            any GNN which supports the :obj:`edge_weight` parameter).
+            (default: :obj:`None`)
+        dropout (float, optional): Dropout probability of the normalized
+            attention coefficients which exposes each node to a stochastically
+            sampled neighborhood during training. (default: :obj:`0`)
+        negative_slope (float, optional): LeakyReLU angle of the negative
+            slope. (default: :obj:`0.2`)
+        add_self_loops (bool, optional): If set to :obj:`True`, will add self
+            loops to the new graph connectivity. (default: :obj:`False`)
+        **kwargs (optional): Additional parameters for initializing the
+            graph neural network layer.
+    """
+    def __init__(self, in_channels, ratio=0.5, GNN=None, dropout=0,
+                 negative_slope=0.2, add_self_loops=False, **kwargs):
+        super(ASAPooling, self).__init__()
+
+        self.in_channels = in_channels
+        self.ratio = ratio
+        self.negative_slope = negative_slope
+        self.dropout = dropout
+        self.GNN = GNN
+        self.add_self_loops = add_self_loops
+
+        self.lin = Linear(in_channels, in_channels)
+        self.att = Linear(2 * in_channels, 1)
+        self.gnn_score = LEConv(self.in_channels, 1)
+        if self.GNN is not None:
+            self.gnn_intra_cluster = GNN(self.in_channels, self.in_channels,
+                                         **kwargs)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.lin.reset_parameters()
+        self.att.reset_parameters()
+        self.gnn_score.reset_parameters()
+        if self.GNN is not None:
+            self.gnn_intra_cluster.reset_parameters()
+
+    def forward(self, x, edge_index, edge_weight=None, batch=None):
+        N = x.size(0)
+
+        edge_index, edge_weight = add_remaining_self_loops(
+            edge_index, edge_weight, fill_value=1, num_nodes=N)
+
+        if batch is None:
+            batch = edge_index.new_zeros(x.size(0))
+
+        x = x.unsqueeze(-1) if x.dim() == 1 else x
+
+        x_pool = x
+        if self.GNN is not None:
+            x_pool = self.gnn_intra_cluster(x=x, edge_index=edge_index,
+                                            edge_weight=edge_weight)
+
+        x_pool_j = x_pool[edge_index[0]]
+        x_q = scatter(x_pool_j, edge_index[1], dim=0, reduce='max')
+        x_q = self.lin(x_q)[edge_index[1]]
+
+        score = self.att(torch.cat([x_q, x_pool_j], dim=-1)).view(-1)
+        score = F.leaky_relu(score, self.negative_slope)
+        score = softmax(score, edge_index[1], num_nodes=N)
+
+        # Sample attention coefficients stochastically.
+        score = F.dropout(score, p=self.dropout, training=self.training)
+
+        v_j = x[edge_index[0]] * score.view(-1, 1)
+        x = scatter(v_j, edge_index[1], dim=0, reduce='add')
+
+        # Cluster selection.
+        fitness = self.gnn_score(x, edge_index).sigmoid().view(-1)
+        perm = topk(fitness, self.ratio, batch)
+        x = x[perm] * fitness[perm].view(-1, 1)
+        batch = batch[perm]
+
+        # Graph coarsening.
+        row, col = edge_index
+        A = SparseTensor(row=row, col=col, value=edge_weight,
+                         sparse_sizes=(N, N))
+        S = SparseTensor(row=row, col=col, value=score, sparse_sizes=(N, N))
+        S = S[:, perm]
+
+        A = S.t() @ A @ S
+
+        if self.add_self_loops:
+            A = A.fill_diag(1.)
+        else:
+            A = A.remove_diag()
+
+        row, col, edge_weight = A.coo()
+        edge_index = torch.stack([row, col], dim=0)
+
+        return x, edge_index, edge_weight, batch, perm
+
+    def __repr__(self):
+        return '{}({}, ratio={})'.format(self.__class__.__name__,
+                                         self.in_channels, self.ratio)
+import torch
+from torch.nn import Parameter
+from torch_scatter import scatter_add, scatter_max
+from torch_geometric.utils import softmax
+
+from ..inits import uniform
+from ...utils.num_nodes import maybe_num_nodes
+
+
+def topk(x, ratio, batch, min_score=None, tol=1e-7):
+    if min_score is not None:
+        # Make sure that we do not drop all nodes in a graph.
+        scores_max = scatter_max(x, batch)[0][batch] - tol
+        scores_min = scores_max.clamp(max=min_score)
+
+        perm = torch.nonzero(x > scores_min).view(-1)
+    else:
+        num_nodes = scatter_add(batch.new_ones(x.size(0)), batch, dim=0)
+        batch_size, max_num_nodes = num_nodes.size(0), num_nodes.max().item()
+
+        cum_num_nodes = torch.cat(
+            [num_nodes.new_zeros(1),
+             num_nodes.cumsum(dim=0)[:-1]], dim=0)
+
+        index = torch.arange(batch.size(0), dtype=torch.long, device=x.device)
+        index = (index - cum_num_nodes[batch]) + (batch * max_num_nodes)
+
+        dense_x = x.new_full((batch_size * max_num_nodes, ),
+                             torch.finfo(x.dtype).min)
+        dense_x[index] = x
+        dense_x = dense_x.view(batch_size, max_num_nodes)
+
+        _, perm = dense_x.sort(dim=-1, descending=True)
+
+        perm = perm + cum_num_nodes.view(-1, 1)
+        perm = perm.view(-1)
+
+        k = (ratio * num_nodes.to(torch.float)).ceil().to(torch.long)
+        mask = [
+            torch.arange(k[i], dtype=torch.long, device=x.device) +
+            i * max_num_nodes for i in range(batch_size)
+        ]
+        mask = torch.cat(mask, dim=0)
+
+        perm = perm[mask]
+
+    return perm
+
+
+def filter_adj(edge_index, edge_attr, perm, num_nodes=None):
+    num_nodes = maybe_num_nodes(edge_index, num_nodes)
+
+    mask = perm.new_full((num_nodes, ), -1)
+    i = torch.arange(perm.size(0), dtype=torch.long, device=perm.device)
+    mask[perm] = i
+
+    row, col = edge_index
+    row, col = mask[row], mask[col]
+    mask = (row >= 0) & (col >= 0)
+    row, col = row[mask], col[mask]
+
+    if edge_attr is not None:
+        edge_attr = edge_attr[mask]
+
+    return torch.stack([row, col], dim=0), edge_attr
+
+
+class TopKPooling(torch.nn.Module):
+    r""":math:`\mathrm{top}_k` pooling operator from the `"Graph U-Nets"
+    <https://arxiv.org/abs/1905.05178>`_, `"Towards Sparse
+    Hierarchical Graph Classifiers" <https://arxiv.org/abs/1811.01287>`_
+    and `"Understanding Attention and Generalization in Graph Neural
+    Networks" <https://arxiv.org/abs/1905.02850>`_ papers
+
+    if min_score :math:`\tilde{\alpha}` is None:
+
+        .. math::
+            \mathbf{y} &= \frac{\mathbf{X}\mathbf{p}}{\| \mathbf{p} \|}
+
+            \mathbf{i} &= \mathrm{top}_k(\mathbf{y})
+
+            \mathbf{X}^{\prime} &= (\mathbf{X} \odot
+            \mathrm{tanh}(\mathbf{y}))_{\mathbf{i}}
+
+            \mathbf{A}^{\prime} &= \mathbf{A}_{\mathbf{i},\mathbf{i}}
+
+    if min_score :math:`\tilde{\alpha}` is a value in [0, 1]:
+
+        .. math::
+            \mathbf{y} &= \mathrm{softmax}(\mathbf{X}\mathbf{p})
+
+            \mathbf{i} &= \mathbf{y}_i > \tilde{\alpha}
+
+            \mathbf{X}^{\prime} &= (\mathbf{X} \odot \mathbf{y})_{\mathbf{i}}
+
+            \mathbf{A}^{\prime} &= \mathbf{A}_{\mathbf{i},\mathbf{i}},
+
+    where nodes are dropped based on a learnable projection score
+    :math:`\mathbf{p}`.
+
+    Args:
+        in_channels (int): Size of each input sample.
+        ratio (float): Graph pooling ratio, which is used to compute
+            :math:`k = \lceil \mathrm{ratio} \cdot N \rceil`.
+            This value is ignored if min_score is not None.
+            (default: :obj:`0.5`)
+        min_score (float, optional): Minimal node score :math:`\tilde{\alpha}`
+            which is used to compute indices of pooled nodes
+            :math:`\mathbf{i} = \mathbf{y}_i > \tilde{\alpha}`.
+            When this value is not :obj:`None`, the :obj:`ratio` argument is
+            ignored. (default: :obj:`None`)
+        multiplier (float, optional): Coefficient by which features gets
+            multiplied after pooling. This can be useful for large graphs and
+            when :obj:`min_score` is used. (default: :obj:`1`)
+        nonlinearity (torch.nn.functional, optional): The nonlinearity to use.
+            (default: :obj:`torch.tanh`)
+    """
+
+    def __init__(self, in_channels, ratio=0.5, min_score=None, multiplier=1,
+                 nonlinearity=torch.tanh):
+        super(TopKPooling, self).__init__()
+
+        self.in_channels = in_channels
+        self.ratio = ratio
+        self.min_score = min_score
+        self.multiplier = multiplier
+        self.nonlinearity = nonlinearity
+
+        self.weight = Parameter(torch.Tensor(1, in_channels))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        size = self.in_channels
+        uniform(size, self.weight)
+
+    def forward(self, x, edge_index, edge_attr=None, batch=None, attn=None):
+        """"""
+
+        if batch is None:
+            batch = edge_index.new_zeros(x.size(0))
+
+        attn = x if attn is None else attn
+        attn = attn.unsqueeze(-1) if attn.dim() == 1 else attn
+        score = (attn * self.weight).sum(dim=-1)
+
+        if self.min_score is None:
+            score = self.nonlinearity(score / self.weight.norm(p=2, dim=-1))
+        else:
+            score = softmax(score, batch)
+
+        perm = topk(score, self.ratio, batch, self.min_score)
+        x = x[perm] * score[perm].view(-1, 1)
+        x = self.multiplier * x if self.multiplier != 1 else x
+
+        batch = batch[perm]
+        edge_index, edge_attr = filter_adj(edge_index, edge_attr, perm,
+                                           num_nodes=score.size(0))
+
+        return x, edge_index, edge_attr, batch, perm, score[perm]
+
+    def __repr__(self):
+        return '{}({}, {}={}, multiplier={})'.format(
+            self.__class__.__name__, self.in_channels,
+            'ratio' if self.min_score is None else 'min_score',
+            self.ratio if self.min_score is None else self.min_score,
+            self.multiplier)
+from torch_scatter import scatter
+from torch_geometric.data import Batch
+
+from .consecutive import consecutive_cluster
+from .pool import pool_edge, pool_batch, pool_pos
+
+
+def _max_pool_x(cluster, x, size=None):
+    return scatter(x, cluster, dim=0, dim_size=size, reduce='max')
+
+
+def max_pool_x(cluster, x, batch, size=None):
+    r"""Max-Pools node features according to the clustering defined in
+    :attr:`cluster`.
+
+    Args:
+        cluster (LongTensor): Cluster vector :math:`\mathbf{c} \in \{ 0,
+            \ldots, N - 1 \}^N`, which assigns each node to a specific cluster.
+        x (Tensor): Node feature matrix
+            :math:`\mathbf{X} \in \mathbb{R}^{(N_1 + \ldots + N_B) \times F}`.
+        batch (LongTensor): Batch vector :math:`\mathbf{b} \in {\{ 0, \ldots,
+            B-1\}}^N`, which assigns each node to a specific example.
+        size (int, optional): The maximum number of clusters in a single
+            example. This property is useful to obtain a batch-wise dense
+            representation, *e.g.* for applying FC layers, but should only be
+            used if the size of the maximum number of clusters per example is
+            known in advance. (default: :obj:`None`)
+
+    :rtype: (:class:`Tensor`, :class:`LongTensor`) if :attr:`size` is
+        :obj:`None`, else :class:`Tensor`
+    """
+    if size is not None:
+        return _max_pool_x(cluster, x, (batch.max().item() + 1) * size)
+
+    cluster, perm = consecutive_cluster(cluster)
+    x = _max_pool_x(cluster, x)
+    batch = pool_batch(perm, batch)
+
+    return x, batch
+
+
+def max_pool(cluster, data, transform=None):
+    r"""Pools and coarsens a graph given by the
+    :class:`torch_geometric.data.Data` object according to the clustering
+    defined in :attr:`cluster`.
+    All nodes within the same cluster will be represented as one node.
+    Final node features are defined by the *maximum* features of all nodes
+    within the same cluster, node positions are averaged and edge indices are
+    defined to be the union of the edge indices of all nodes within the same
+    cluster.
+
+    Args:
+        cluster (LongTensor): Cluster vector :math:`\mathbf{c} \in \{ 0,
+            \ldots, N - 1 \}^N`, which assigns each node to a specific cluster.
+        data (Data): Graph data object.
+        transform (callable, optional): A function/transform that takes in the
+            coarsened and pooled :obj:`torch_geometric.data.Data` object and
+            returns a transformed version. (default: :obj:`None`)
+
+    :rtype: :class:`torch_geometric.data.Data`
+    """
+    cluster, perm = consecutive_cluster(cluster)
+
+    x = None if data.x is None else _max_pool_x(cluster, data.x)
+    index, attr = pool_edge(cluster, data.edge_index, data.edge_attr)
+    batch = None if data.batch is None else pool_batch(perm, data.batch)
+    pos = None if data.pos is None else pool_pos(cluster, data.pos)
+
+    data = Batch(batch=batch, x=x, edge_index=index, edge_attr=attr, pos=pos)
+
+    if transform is not None:
+        data = transform(data)
+
+    return data
+import torch
+
+
+def consecutive_cluster(src):
+    unique, inv = torch.unique(src, sorted=True, return_inverse=True)
+    perm = torch.arange(inv.size(0), dtype=inv.dtype, device=inv.device)
+    perm = inv.new_empty(unique.size(0)).scatter_(0, inv, perm)
+    return inv, perm
+from torch_scatter import scatter
+from torch_geometric.data import Batch
+
+from .consecutive import consecutive_cluster
+from .pool import pool_edge, pool_batch, pool_pos
+
+
+def _avg_pool_x(cluster, x, size=None):
+    return scatter(x, cluster, dim=0, dim_size=size, reduce='mean')
+
+
+def avg_pool_x(cluster, x, batch, size=None):
+    r"""Average pools node features according to the clustering defined in
+    :attr:`cluster`.
+    See :meth:`torch_geometric.nn.pool.max_pool_x` for more details.
+
+    Args:
+        cluster (LongTensor): Cluster vector :math:`\mathbf{c} \in \{ 0,
+            \ldots, N - 1 \}^N`, which assigns each node to a specific cluster.
+        x (Tensor): Node feature matrix
+            :math:`\mathbf{X} \in \mathbb{R}^{(N_1 + \ldots + N_B) \times F}`.
+        batch (LongTensor): Batch vector :math:`\mathbf{b} \in {\{ 0, \ldots,
+            B-1\}}^N`, which assigns each node to a specific example.
+        size (int, optional): The maximum number of clusters in a single
+            example. (default: :obj:`None`)
+
+    :rtype: (:class:`Tensor`, :class:`LongTensor`) if :attr:`size` is
+        :obj:`None`, else :class:`Tensor`
+    """
+    if size is not None:
+        return _avg_pool_x(cluster, x, (batch.max().item() + 1) * size)
+
+    cluster, perm = consecutive_cluster(cluster)
+    x = _avg_pool_x(cluster, x)
+    batch = pool_batch(perm, batch)
+
+    return x, batch
+
+
+def avg_pool(cluster, data, transform=None):
+    r"""Pools and coarsens a graph given by the
+    :class:`torch_geometric.data.Data` object according to the clustering
+    defined in :attr:`cluster`.
+    Final node features are defined by the *average* features of all nodes
+    within the same cluster.
+    See :meth:`torch_geometric.nn.pool.max_pool` for more details.
+
+    Args:
+        cluster (LongTensor): Cluster vector :math:`\mathbf{c} \in \{ 0,
+            \ldots, N - 1 \}^N`, which assigns each node to a specific cluster.
+        data (Data): Graph data object.
+        transform (callable, optional): A function/transform that takes in the
+            coarsened and pooled :obj:`torch_geometric.data.Data` object and
+            returns a transformed version. (default: :obj:`None`)
+
+    :rtype: :class:`torch_geometric.data.Data`
+    """
+    cluster, perm = consecutive_cluster(cluster)
+
+    x = None if data.x is None else _avg_pool_x(cluster, data.x)
+    index, attr = pool_edge(cluster, data.edge_index, data.edge_attr)
+    batch = None if data.batch is None else pool_batch(perm, data.batch)
+    pos = None if data.pos is None else pool_pos(cluster, data.pos)
+
+    data = Batch(batch=batch, x=x, edge_index=index, edge_attr=attr, pos=pos)
+
+    if transform is not None:
+        data = transform(data)
+
+    return data
+from collections import namedtuple
+
+import torch
+import torch.nn.functional as F
+from torch_scatter import scatter_add
+from torch_sparse import coalesce
+from torch_geometric.utils import softmax
+
+
+class EdgePooling(torch.nn.Module):
+    r"""The edge pooling operator from the `"Towards Graph Pooling by Edge
+    Contraction" <https://graphreason.github.io/papers/17.pdf>`_ and
+    `"Edge Contraction Pooling for Graph Neural Networks"
+    <https://arxiv.org/abs/1905.10990>`_ papers.
+
+    In short, a score is computed for each edge.
+    Edges are contracted iteratively according to that score unless one of
+    their nodes has already been part of a contracted edge.
+
+    To duplicate the configuration from the "Towards Graph Pooling by Edge
+    Contraction" paper, use either
+    :func:`EdgePooling.compute_edge_score_softmax`
+    or :func:`EdgePooling.compute_edge_score_tanh`, and set
+    :obj:`add_to_edge_score` to :obj:`0`.
+
+    To duplicate the configuration from the "Edge Contraction Pooling for
+    Graph Neural Networks" paper, set :obj:`dropout` to :obj:`0.2`.
+
+    Args:
+        in_channels (int): Size of each input sample.
+        edge_score_method (function, optional): The function to apply
+            to compute the edge score from raw edge scores. By default,
+            this is the softmax over all incoming edges for each node.
+            This function takes in a :obj:`raw_edge_score` tensor of shape
+            :obj:`[num_nodes]`, an :obj:`edge_index` tensor and the number of
+            nodes :obj:`num_nodes`, and produces a new tensor of the same size
+            as :obj:`raw_edge_score` describing normalized edge scores.
+            Included functions are
+            :func:`EdgePooling.compute_edge_score_softmax`,
+            :func:`EdgePooling.compute_edge_score_tanh`, and
+            :func:`EdgePooling.compute_edge_score_sigmoid`.
+            (default: :func:`EdgePooling.compute_edge_score_softmax`)
+        dropout (float, optional): The probability with
+            which to drop edge scores during training. (default: :obj:`0`)
+        add_to_edge_score (float, optional): This is added to each
+            computed edge score. Adding this greatly helps with unpool
+            stability. (default: :obj:`0.5`)
+    """
+
+    unpool_description = namedtuple(
+        "UnpoolDescription",
+        ["edge_index", "cluster", "batch", "new_edge_score"])
+
+    def __init__(self, in_channels, edge_score_method=None, dropout=0,
+                 add_to_edge_score=0.5):
+        super(EdgePooling, self).__init__()
+        self.in_channels = in_channels
+        if edge_score_method is None:
+            edge_score_method = self.compute_edge_score_softmax
+        self.compute_edge_score = edge_score_method
+        self.add_to_edge_score = add_to_edge_score
+        self.dropout = dropout
+
+        self.lin = torch.nn.Linear(2 * in_channels, 1)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.lin.reset_parameters()
+
+    @staticmethod
+    def compute_edge_score_softmax(raw_edge_score, edge_index, num_nodes):
+        return softmax(raw_edge_score, edge_index[1], num_nodes)
+
+    @staticmethod
+    def compute_edge_score_tanh(raw_edge_score, edge_index, num_nodes):
+        return torch.tanh(raw_edge_score)
+
+    @staticmethod
+    def compute_edge_score_sigmoid(raw_edge_score, edge_index, num_nodes):
+        return torch.sigmoid(raw_edge_score)
+
+    def forward(self, x, edge_index, batch):
+        r"""Forward computation which computes the raw edge score, normalizes
+        it, and merges the edges.
+
+        Args:
+            x (Tensor): The node features.
+            edge_index (LongTensor): The edge indices.
+            batch (LongTensor): Batch vector
+                :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`, which assigns
+                each node to a specific example.
+
+        Return types:
+            * **x** *(Tensor)* - The pooled node features.
+            * **edge_index** *(LongTensor)* - The coarsened edge indices.
+            * **batch** *(LongTensor)* - The coarsened batch vector.
+            * **unpool_info** *(unpool_description)* - Information that is
+              consumed by :func:`EdgePooling.unpool` for unpooling.
+        """
+        e = torch.cat([x[edge_index[0]], x[edge_index[1]]], dim=-1)
+        e = self.lin(e).view(-1)
+        e = F.dropout(e, p=self.dropout, training=self.training)
+        e = self.compute_edge_score(e, edge_index, x.size(0))
+        e = e + self.add_to_edge_score
+
+        x, edge_index, batch, unpool_info = self.__merge_edges__(
+            x, edge_index, batch, e)
+
+        return x, edge_index, batch, unpool_info
+
+    def __merge_edges__(self, x, edge_index, batch, edge_score):
+        nodes_remaining = set(range(x.size(0)))
+
+        cluster = torch.empty_like(batch, device=torch.device('cpu'))
+        edge_argsort = torch.argsort(edge_score, descending=True)
+
+        # Iterate through all edges, selecting it if it is not incident to
+        # another already chosen edge.
+        i = 0
+        new_edge_indices = []
+        edge_index_cpu = edge_index.cpu()
+        for edge_idx in edge_argsort.tolist():
+            source = edge_index_cpu[0, edge_idx].item()
+            if source not in nodes_remaining:
+                continue
+
+            target = edge_index_cpu[1, edge_idx].item()
+            if target not in nodes_remaining:
+                continue
+
+            new_edge_indices.append(edge_idx)
+
+            cluster[source] = i
+            nodes_remaining.remove(source)
+
+            if source != target:
+                cluster[target] = i
+                nodes_remaining.remove(target)
+
+            i += 1
+
+        # The remaining nodes are simply kept.
+        for node_idx in nodes_remaining:
+            cluster[node_idx] = i
+            i += 1
+        cluster = cluster.to(x.device)
+
+        # We compute the new features as an addition of the old ones.
+        new_x = scatter_add(x, cluster, dim=0, dim_size=i)
+        new_edge_score = edge_score[new_edge_indices]
+        if len(nodes_remaining) > 0:
+            remaining_score = x.new_ones(
+                (new_x.size(0) - len(new_edge_indices), ))
+            new_edge_score = torch.cat([new_edge_score, remaining_score])
+        new_x = new_x * new_edge_score.view(-1, 1)
+
+        N = new_x.size(0)
+        new_edge_index, _ = coalesce(cluster[edge_index], None, N, N)
+
+        new_batch = x.new_empty(new_x.size(0), dtype=torch.long)
+        new_batch = new_batch.scatter_(0, cluster, batch)
+
+        unpool_info = self.unpool_description(edge_index=edge_index,
+                                              cluster=cluster, batch=batch,
+                                              new_edge_score=new_edge_score)
+
+        return new_x, new_edge_index, new_batch, unpool_info
+
+    def unpool(self, x, unpool_info):
+        r"""Unpools a previous edge pooling step.
+
+        For unpooling, :obj:`x` should be of same shape as those produced by
+        this layer's :func:`forward` function. Then, it will produce an
+        unpooled :obj:`x` in addition to :obj:`edge_index` and :obj:`batch`.
+
+        Args:
+            x (Tensor): The node features.
+            unpool_info (unpool_description): Information that has
+                been produced by :func:`EdgePooling.forward`.
+
+        Return types:
+            * **x** *(Tensor)* - The unpooled node features.
+            * **edge_index** *(LongTensor)* - The new edge indices.
+            * **batch** *(LongTensor)* - The new batch vector.
+        """
+
+        new_x = x / unpool_info.new_edge_score.view(-1, 1)
+        new_x = new_x[unpool_info.cluster]
+        return new_x, unpool_info.edge_index, unpool_info.batch
+
+    def __repr__(self):
+        return '{}({})'.format(self.__class__.__name__, self.in_channels)
+import torch
+from torch_geometric.nn import GraphConv
+from torch_geometric.nn.pool.topk_pool import topk, filter_adj
+from torch_geometric.utils import softmax
+
+
+class SAGPooling(torch.nn.Module):
+    r"""The self-attention pooling operator from the `"Self-Attention Graph
+    Pooling" <https://arxiv.org/abs/1904.08082>`_ and `"Understanding
+    Attention and Generalization in Graph Neural Networks"
+    <https://arxiv.org/abs/1905.02850>`_ papers
+
+    if :obj:`min_score` :math:`\tilde{\alpha}` is :obj:`None`:
+
+        .. math::
+            \mathbf{y} &= \textrm{GNN}(\mathbf{X}, \mathbf{A})
+
+            \mathbf{i} &= \mathrm{top}_k(\mathbf{y})
+
+            \mathbf{X}^{\prime} &= (\mathbf{X} \odot
+            \mathrm{tanh}(\mathbf{y}))_{\mathbf{i}}
+
+            \mathbf{A}^{\prime} &= \mathbf{A}_{\mathbf{i},\mathbf{i}}
+
+    if :obj:`min_score` :math:`\tilde{\alpha}` is a value in [0, 1]:
+
+        .. math::
+            \mathbf{y} &= \mathrm{softmax}(\textrm{GNN}(\mathbf{X},\mathbf{A}))
+
+            \mathbf{i} &= \mathbf{y}_i > \tilde{\alpha}
+
+            \mathbf{X}^{\prime} &= (\mathbf{X} \odot \mathbf{y})_{\mathbf{i}}
+
+            \mathbf{A}^{\prime} &= \mathbf{A}_{\mathbf{i},\mathbf{i}},
+
+    where nodes are dropped based on a learnable projection score
+    :math:`\mathbf{p}`.
+    Projections scores are learned based on a graph neural network layer.
+
+    Args:
+        in_channels (int): Size of each input sample.
+        ratio (float): Graph pooling ratio, which is used to compute
+            :math:`k = \lceil \mathrm{ratio} \cdot N \rceil`.
+            This value is ignored if min_score is not None.
+            (default: :obj:`0.5`)
+        GNN (torch.nn.Module, optional): A graph neural network layer for
+            calculating projection scores (one of
+            :class:`torch_geometric.nn.conv.GraphConv`,
+            :class:`torch_geometric.nn.conv.GCNConv`,
+            :class:`torch_geometric.nn.conv.GATConv` or
+            :class:`torch_geometric.nn.conv.SAGEConv`). (default:
+            :class:`torch_geometric.nn.conv.GraphConv`)
+        min_score (float, optional): Minimal node score :math:`\tilde{\alpha}`
+            which is used to compute indices of pooled nodes
+            :math:`\mathbf{i} = \mathbf{y}_i > \tilde{\alpha}`.
+            When this value is not :obj:`None`, the :obj:`ratio` argument is
+            ignored. (default: :obj:`None`)
+        multiplier (float, optional): Coefficient by which features gets
+            multiplied after pooling. This can be useful for large graphs and
+            when :obj:`min_score` is used. (default: :obj:`1`)
+        nonlinearity (torch.nn.functional, optional): The nonlinearity to use.
+            (default: :obj:`torch.tanh`)
+        **kwargs (optional): Additional parameters for initializing the graph
+            neural network layer.
+    """
+
+    def __init__(self, in_channels, ratio=0.5, GNN=GraphConv, min_score=None,
+                 multiplier=1, nonlinearity=torch.tanh, **kwargs):
+        super(SAGPooling, self).__init__()
+
+        self.in_channels = in_channels
+        self.ratio = ratio
+        self.gnn = GNN(in_channels, 1, **kwargs)
+        self.min_score = min_score
+        self.multiplier = multiplier
+        self.nonlinearity = nonlinearity
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.gnn.reset_parameters()
+
+    def forward(self, x, edge_index, edge_attr=None, batch=None, attn=None):
+        """"""
+        if batch is None:
+            batch = edge_index.new_zeros(x.size(0))
+
+        attn = x if attn is None else attn
+        attn = attn.unsqueeze(-1) if attn.dim() == 1 else attn
+        score = self.gnn(attn, edge_index).view(-1)
+
+        if self.min_score is None:
+            score = self.nonlinearity(score)
+        else:
+            score = softmax(score, batch)
+
+        perm = topk(score, self.ratio, batch, self.min_score)
+        x = x[perm] * score[perm].view(-1, 1)
+        x = self.multiplier * x if self.multiplier != 1 else x
+
+        batch = batch[perm]
+        edge_index, edge_attr = filter_adj(edge_index, edge_attr, perm,
+                                           num_nodes=score.size(0))
+
+        return x, edge_index, edge_attr, batch, perm, score[perm]
+
+    def __repr__(self):
+        return '{}({}, {}, {}={}, multiplier={})'.format(
+            self.__class__.__name__, self.gnn.__class__.__name__,
+            self.in_channels,
+            'ratio' if self.min_score is None else 'min_score',
+            self.ratio if self.min_score is None else self.min_score,
+            self.multiplier)
+from .max_pool import max_pool, max_pool_x
+from .avg_pool import avg_pool, avg_pool_x
+from .graclus import graclus
+from .voxel_grid import voxel_grid
+from .topk_pool import TopKPooling
+from .sag_pool import SAGPooling
+from .edge_pool import EdgePooling
+from .asap import ASAPooling
+
+try:
+    import torch_cluster
+except ImportError:
+    torch_cluster = None
+
+
+def fps(x, batch=None, ratio=0.5, random_start=True):
+    r""""A sampling algorithm from the `"PointNet++: Deep Hierarchical Feature
+    Learning on Point Sets in a Metric Space"
+    <https://arxiv.org/abs/1706.02413>`_ paper, which iteratively samples the
+    most distant point with regard to the rest points.
+
+    Args:
+        x (Tensor): Node feature matrix
+            :math:`\mathbf{X} \in \mathbb{R}^{N \times F}`.
+        batch (LongTensor, optional): Batch vector
+            :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`, which assigns each
+            node to a specific example. (default: :obj:`None`)
+        ratio (float, optional): Sampling ratio. (default: :obj:`0.5`)
+        random_start (bool, optional): If set to :obj:`False`, use the first
+            node in :math:`\mathbf{X}` as starting node. (default: obj:`True`)
+
+    :rtype: :class:`LongTensor`
+
+    .. code-block:: python
+
+        import torch
+        from torch_geometric.nn import fps
+
+        x = torch.Tensor([[-1, -1], [-1, 1], [1, -1], [1, 1]])
+        batch = torch.tensor([0, 0, 0, 0])
+        index = fps(x, batch, ratio=0.5)
+    """
+    if torch_cluster is None:
+        raise ImportError('`fps` requires `torch-cluster`.')
+
+    return torch_cluster.fps(x, batch, ratio, random_start)
+
+
+def knn(x, y, k, batch_x=None, batch_y=None, cosine=False):
+    r"""Finds for each element in :obj:`y` the :obj:`k` nearest points in
+    :obj:`x`.
+
+    Args:
+        x (Tensor): Node feature matrix
+            :math:`\mathbf{X} \in \mathbb{R}^{N \times F}`.
+        y (Tensor): Node feature matrix
+            :math:`\mathbf{X} \in \mathbb{R}^{M \times F}`.
+        k (int): The number of neighbors.
+        batch_x (LongTensor, optional): Batch vector
+            :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`, which assigns each
+            node to a specific example. (default: :obj:`None`)
+        batch_y (LongTensor, optional): Batch vector
+            :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^M`, which assigns each
+            node to a specific example. (default: :obj:`None`)
+        cosine (boolean, optional): If :obj:`True`, will use the cosine
+            distance instead of euclidean distance to find nearest neighbors.
+            (default: :obj:`False`)
+
+    :rtype: :class:`LongTensor`
+
+    .. code-block:: python
+
+        import torch
+        from torch_geometric.nn import knn
+
+        x = torch.Tensor([[-1, -1], [-1, 1], [1, -1], [1, 1]])
+        batch_x = torch.tensor([0, 0, 0, 0])
+        y = torch.Tensor([[-1, 0], [1, 0]])
+        batch_x = torch.tensor([0, 0])
+        assign_index = knn(x, y, 2, batch_x, batch_y)
+    """
+    if torch_cluster is None:
+        raise ImportError('`knn` requires `torch-cluster`.')
+
+    return torch_cluster.knn(x, y, k, batch_x, batch_y, cosine)
+
+
+def knn_graph(x, k, batch=None, loop=False, flow='source_to_target',
+              cosine=False):
+    r"""Computes graph edges to the nearest :obj:`k` points.
+
+    Args:
+        x (Tensor): Node feature matrix
+            :math:`\mathbf{X} \in \mathbb{R}^{N \times F}`.
+        k (int): The number of neighbors.
+        batch (LongTensor, optional): Batch vector
+            :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`, which assigns each
+            node to a specific example. (default: :obj:`None`)
+        loop (bool, optional): If :obj:`True`, the graph will contain
+            self-loops. (default: :obj:`False`)
+        flow (string, optional): The flow direction when using in combination
+            with message passing (:obj:`"source_to_target"` or
+            :obj:`"target_to_source"`). (default: :obj:`"source_to_target"`)
+        cosine (boolean, optional): If :obj:`True`, will use the cosine
+            distance instead of euclidean distance to find nearest neighbors.
+            (default: :obj:`False`)
+
+    :rtype: :class:`LongTensor`
+
+    .. code-block:: python
+
+        import torch
+        from torch_geometric.nn import knn_graph
+
+        x = torch.Tensor([[-1, -1], [-1, 1], [1, -1], [1, 1]])
+        batch = torch.tensor([0, 0, 0, 0])
+        edge_index = knn_graph(x, k=2, batch=batch, loop=False)
+    """
+    if torch_cluster is None:
+        raise ImportError('`knn_graph` requires `torch-cluster`.')
+
+    return torch_cluster.knn_graph(x, k, batch, loop, flow, cosine)
+
+
+def radius(x, y, r, batch_x=None, batch_y=None, max_num_neighbors=32):
+    r"""Finds for each element in :obj:`y` all points in :obj:`x` within
+    distance :obj:`r`.
+
+    Args:
+        x (Tensor): Node feature matrix
+            :math:`\mathbf{X} \in \mathbb{R}^{N \times F}`.
+        y (Tensor): Node feature matrix
+            :math:`\mathbf{Y} \in \mathbb{R}^{M \times F}`.
+        r (float): The radius.
+        batch_x (LongTensor, optional): Batch vector
+            :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`, which assigns each
+            node to a specific example. (default: :obj:`None`)
+        batch_y (LongTensor, optional): Batch vector
+            :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^M`, which assigns each
+            node to a specific example. (default: :obj:`None`)
+        max_num_neighbors (int, optional): The maximum number of neighbors to
+            return for each element in :obj:`y`. (default: :obj:`32`)
+
+    :rtype: :class:`LongTensor`
+
+    .. code-block:: python
+
+        import torch
+        from torch_geometric.nn import radius
+
+        x = torch.Tensor([[-1, -1], [-1, 1], [1, -1], [1, 1]])
+        batch_x = torch.tensor([0, 0, 0, 0])
+        y = torch.Tensor([[-1, 0], [1, 0]])
+        batch_y = torch.tensor([0, 0])
+        assign_index = radius(x, y, 1.5, batch_x, batch_y)
+    """
+    if torch_cluster is None:
+        raise ImportError('`radius` requires `torch-cluster`.')
+
+    return torch_cluster.radius(x, y, r, batch_x, batch_y, max_num_neighbors)
+
+
+def radius_graph(x, r, batch=None, loop=False, max_num_neighbors=32,
+                 flow='source_to_target'):
+    r"""Computes graph edges to all points within a given distance.
+
+    Args:
+        x (Tensor): Node feature matrix
+            :math:`\mathbf{X} \in \mathbb{R}^{N \times F}`.
+        r (float): The radius.
+        batch (LongTensor, optional): Batch vector
+            :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`, which assigns each
+            node to a specific example. (default: :obj:`None`)
+        loop (bool, optional): If :obj:`True`, the graph will contain
+            self-loops. (default: :obj:`False`)
+        max_num_neighbors (int, optional): The maximum number of neighbors to
+            return for each element in :obj:`y`. (default: :obj:`32`)
+        flow (string, optional): The flow direction when using in combination
+            with message passing (:obj:`"source_to_target"` or
+            :obj:`"target_to_source"`). (default: :obj:`"source_to_target"`)
+
+    :rtype: :class:`LongTensor`
+
+    .. code-block:: python
+
+        import torch
+        from torch_geometric.nn import radius_graph
+
+        x = torch.Tensor([[-1, -1], [-1, 1], [1, -1], [1, 1]])
+        batch = torch.tensor([0, 0, 0, 0])
+        edge_index = radius_graph(x, r=1.5, batch=batch, loop=False)
+    """
+    if torch_cluster is None:
+        raise ImportError('`radius_graph` requires `torch-cluster`.')
+
+    return torch_cluster.radius_graph(x, r, batch, loop, max_num_neighbors,
+                                      flow)
+
+
+def nearest(x, y, batch_x=None, batch_y=None):
+    r"""Clusters points in :obj:`x` together which are nearest to a given query
+    point in :obj:`y`.
+
+    Args:
+        x (Tensor): Node feature matrix
+            :math:`\mathbf{X} \in \mathbb{R}^{N \times F}`.
+        y (Tensor): Node feature matrix
+            :math:`\mathbf{Y} \in \mathbb{R}^{M \times F}`.
+        batch_x (LongTensor, optional): Batch vector
+            :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`, which assigns each
+            node to a specific example. (default: :obj:`None`)
+        batch_y (LongTensor, optional): Batch vector
+            :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^M`, which assigns each
+            node to a specific example. (default: :obj:`None`)
+
+    :rtype: :class:`LongTensor`
+
+    .. code-block:: python
+
+        import torch
+        from torch_geometric.nn import nearest
+
+        x = torch.Tensor([[-1, -1], [-1, 1], [1, -1], [1, 1]])
+        batch_x = torch.tensor([0, 0, 0, 0])
+        y = torch.Tensor([[-1, 0], [1, 0]])
+        batch_y = torch.tensor([0, 0])
+        cluster = nearest(x, y, batch_x, batch_y)
+    """
+    if torch_cluster is None:
+        raise ImportError('`radius` requires `torch-cluster`.')
+
+    return torch_cluster.nearest(x, y, batch_x, batch_y)
+
+
+__all__ = [
+    'TopKPooling',
+    'SAGPooling',
+    'EdgePooling',
+    'ASAPooling',
+    'max_pool',
+    'avg_pool',
+    'max_pool_x',
+    'avg_pool_x',
+    'graclus',
+    'voxel_grid',
+    'fps',
+    'knn',
+    'knn_graph',
+    'radius',
+    'radius_graph',
+    'nearest',
+]
+import torch
+from torch_geometric.utils.repeat import repeat
+
+try:
+    from torch_cluster import grid_cluster
+except ImportError:
+    grid_cluster = None
+
+
+def voxel_grid(pos, batch, size, start=None, end=None):
+    r"""Voxel grid pooling from the, *e.g.*, `Dynamic Edge-Conditioned Filters
+    in Convolutional Networks on Graphs <https://arxiv.org/abs/1704.02901>`_
+    paper, which overlays a regular grid of user-defined size over a point
+    cloud and clusters all points within the same voxel.
+
+    Args:
+        pos (Tensor): Node position matrix
+            :math:`\mathbf{X} \in \mathbb{R}^{(N_1 + \ldots + N_B) \times D}`.
+        batch (LongTensor): Batch vector :math:`\mathbf{b} \in {\{ 0, \ldots,
+            B-1\}}^N`, which assigns each node to a specific example.
+        size (float or [float] or Tensor): Size of a voxel (in each dimension).
+        start (float or [float] or Tensor, optional): Start coordinates of the
+            grid (in each dimension). If set to :obj:`None`, will be set to the
+            minimum coordinates found in :attr:`pos`. (default: :obj:`None`)
+        end (float or [float] or Tensor, optional): End coordinates of the grid
+            (in each dimension). If set to :obj:`None`, will be set to the
+            maximum coordinates found in :attr:`pos`. (default: :obj:`None`)
+
+    :rtype: :class:`LongTensor`
+    """
+
+    if grid_cluster is None:
+        raise ImportError('`voxel_grid` requires `torch-cluster`.')
+
+    pos = pos.unsqueeze(-1) if pos.dim() == 1 else pos
+    num_nodes, dim = pos.size()
+
+    size = size.tolist() if torch.is_tensor(size) else size
+    start = start.tolist() if torch.is_tensor(start) else start
+    end = end.tolist() if torch.is_tensor(end) else end
+
+    size, start, end = repeat(size, dim), repeat(start, dim), repeat(end, dim)
+
+    pos = torch.cat([pos, batch.unsqueeze(-1).type_as(pos)], dim=-1)
+    size = size + [1]
+    start = None if start is None else start + [0]
+    end = None if end is None else end + [batch.max().item()]
+
+    size = torch.tensor(size, dtype=pos.dtype, device=pos.device)
+    if start is not None:
+        start = torch.tensor(start, dtype=pos.dtype, device=pos.device)
+    if end is not None:
+        end = torch.tensor(end, dtype=pos.dtype, device=pos.device)
+
+    return grid_cluster(pos, size, start, end)
+from torch.nn import BatchNorm1d
+
+
+class BatchNorm(BatchNorm1d):
+    r"""Applies batch normalization over a batch of node features as described
+    in the `"Batch Normalization: Accelerating Deep Network Training by
+    Reducing Internal Covariate Shift" <https://arxiv.org/abs/1502.03167>`_
+    paper
+
+    .. math::
+        \mathbf{x}^{\prime}_i = \frac{\mathbf{x} -
+        \textrm{E}[\mathbf{x}]}{\sqrt{\textrm{Var}[\mathbf{x}] + \epsilon}}
+        \odot \gamma + \beta
+
+    Args:
+        in_channels (int): Size of each input sample.
+        eps (float, optional): A value added to the denominator for numerical
+            stability. (default: :obj:`1e-5`)
+        momentum (float, optional): The value used for the running mean and
+            running variance computation. (default: :obj:`0.1`)
+        affine (bool, optional): If set to :obj:`True`, this module has
+            learnable affine parameters :math:`\gamma` and :math:`\beta`.
+            (default: :obj:`True`)
+        track_running_stats (bool, optional): If set to :obj:`True`, this
+            module tracks the running mean and variance, and when set to
+            :obj:`False`, this module does not track such statistics and always
+            uses batch statistics in both training and eval modes.
+            (default: :obj:`True`)
+    """
+    def __init__(self, in_channels, eps=1e-5, momentum=0.1, affine=True,
+                 track_running_stats=True):
+        super(BatchNorm, self).__init__(in_channels, eps, momentum, affine,
+                                        track_running_stats)
+
+    def forward(self, x):
+        """"""
+        return super(BatchNorm, self).forward(x)
+
+    def __repr__(self):
+        return ('{}({}, eps={}, momentum={}, affine={}, '
+                'track_running_stats={})').format(self.__class__.__name__,
+                                                  self.num_features, self.eps,
+                                                  self.momentum, self.affine,
+                                                  self.track_running_stats)
+import torch
+from torch.nn.modules.instancenorm import _InstanceNorm
+from torch_scatter import scatter_add
+from torch_geometric.utils import degree
+
+
+class InstanceNorm(_InstanceNorm):
+    r"""Applies instance normalization over each individual example in a batch
+    of node features as described in the `"Instance Normalization: The Missing
+    Ingredient for Fast Stylization" <https://arxiv.org/abs/1607.08022>`_
+    paper
+
+    .. math::
+        \mathbf{x}^{\prime}_i = \frac{\mathbf{x} -
+        \textrm{E}[\mathbf{x}]}{\sqrt{\textrm{Var}[\mathbf{x}] + \epsilon}}
+        \odot \gamma + \beta
+
+    Args:
+        in_channels (int): Size of each input sample.
+        eps (float, optional): A value added to the denominator for numerical
+            stability. (default: :obj:`1e-5`)
+        momentum (float, optional): The value used for the running mean and
+            running variance computation. (default: :obj:`0.1`)
+        affine (bool, optional): If set to :obj:`True`, this module has
+            learnable affine parameters :math:`\gamma` and :math:`\beta`.
+            (default: :obj:`False`)
+        track_running_stats (bool, optional): If set to :obj:`True`, this
+            module tracks the running mean and variance, and when set to
+            :obj:`False`, this module does not track such statistics and always
+            uses instance statistics in both training and eval modes.
+            (default: :obj:`False`)
+    """
+    def __init__(self, in_channels, eps=1e-5, momentum=0.1, affine=False,
+                 track_running_stats=False):
+        super(InstanceNorm, self).__init__(in_channels, eps, momentum, affine,
+                                           track_running_stats)
+
+    def forward(self, x, batch=None):
+        """"""
+        if batch is None:
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+
+        batch_size = batch.max().item() + 1
+
+        if self.training or not self.track_running_stats:
+            count = degree(batch, batch_size, dtype=x.dtype).view(-1, 1)
+            tmp = scatter_add(x, batch, dim=0, dim_size=batch_size)
+            mean = tmp / count.clamp(min=1)
+
+            tmp = (x - mean[batch])
+            tmp = scatter_add(tmp * tmp, batch, dim=0, dim_size=batch_size)
+            var = tmp / count.clamp(min=1)
+            unbiased_var = tmp / (count - 1).clamp(min=1)
+
+        if self.training and self.track_running_stats:
+            momentum = self.momentum
+            self.running_mean = (
+                1 - momentum) * self.running_mean + momentum * mean.mean(dim=0)
+            self.running_var = (
+                1 - momentum
+            ) * self.running_var + momentum * unbiased_var.mean(dim=0)
+
+        if not self.training and self.track_running_stats:
+            mean = self.running_mean.view(1, -1).expand(batch_size, -1)
+            var = self.running_var.view(1, -1).expand(batch_size, -1)
+
+        out = (x - mean[batch]) / torch.sqrt(var[batch] + self.eps)
+
+        if self.affine:
+            out = out * self.weight.view(1, -1) + self.bias.view(1, -1)
+
+        return out
+import torch
+import torch.nn as nn
+from torch_geometric.utils import degree
+
+
+class GraphSizeNorm(nn.Module):
+    r"""Applies Graph Size Normalization over each individual graph in a batch
+    of node features as described in the
+    `"Benchmarking Graph Neural Networks" <https://arxiv.org/abs/2003.00982>`_
+    paper
+
+    .. math::
+        \mathbf{x}^{\prime}_i = \frac{\mathbf{x}_i}{\sqrt{|\mathcal{V}|}}
+    """
+    def __init__(self):
+        super(GraphSizeNorm, self).__init__()
+
+    def forward(self, x, batch=None):
+        """"""
+        if batch is None:
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+
+        inv_sqrt_deg = degree(batch, dtype=x.dtype).pow(-0.5)
+        return x * inv_sqrt_deg[batch].view(-1, 1)
+from .batch_norm import BatchNorm
+from .instance_norm import InstanceNorm
+from .graph_size_norm import GraphSizeNorm
+
+__all__ = [
+    'BatchNorm',
+    'InstanceNorm',
+    'GraphSizeNorm'
+]
+import torch
+from torch_scatter import scatter_add
+from torch_geometric.utils import softmax
+
+from ..inits import reset
+
+
+class GlobalAttention(torch.nn.Module):
+    r"""Global soft attention layer from the `"Gated Graph Sequence Neural
+    Networks" <https://arxiv.org/abs/1511.05493>`_ paper
+
+    .. math::
+        \mathbf{r}_i = \sum_{n=1}^{N_i} \mathrm{softmax} \left(
+        h_{\mathrm{gate}} ( \mathbf{x}_n ) \right) \odot
+        h_{\mathbf{\Theta}} ( \mathbf{x}_n ),
+
+    where :math:`h_{\mathrm{gate}} \colon \mathbb{R}^F \to
+    \mathbb{R}` and :math:`h_{\mathbf{\Theta}}` denote neural networks, *i.e.*
+    MLPS.
+
+    Args:
+        gate_nn (torch.nn.Module): A neural network :math:`h_{\mathrm{gate}}`
+            that computes attention scores by mapping node features :obj:`x` of
+            shape :obj:`[-1, in_channels]` to shape :obj:`[-1, 1]`, *e.g.*,
+            defined by :class:`torch.nn.Sequential`.
+        nn (torch.nn.Module, optional): A neural network
+            :math:`h_{\mathbf{\Theta}}` that maps node features :obj:`x` of
+            shape :obj:`[-1, in_channels]` to shape :obj:`[-1, out_channels]`
+            before combining them with the attention scores, *e.g.*, defined by
+            :class:`torch.nn.Sequential`. (default: :obj:`None`)
+    """
+    def __init__(self, gate_nn, nn=None):
+        super(GlobalAttention, self).__init__()
+        self.gate_nn = gate_nn
+        self.nn = nn
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        reset(self.gate_nn)
+        reset(self.nn)
+
+    def forward(self, x, batch, size=None):
+        """"""
+        x = x.unsqueeze(-1) if x.dim() == 1 else x
+        size = batch[-1].item() + 1 if size is None else size
+
+        gate = self.gate_nn(x).view(-1, 1)
+        x = self.nn(x) if self.nn is not None else x
+        assert gate.dim() == x.dim() and gate.size(0) == x.size(0)
+
+        gate = softmax(gate, batch, size)
+        out = scatter_add(gate * x, batch, dim=0, dim_size=size)
+
+        return out
+
+    def __repr__(self):
+        return '{}(gate_nn={}, nn={})'.format(self.__class__.__name__,
+                                              self.gate_nn, self.nn)
+import torch
+from torch_scatter import scatter_add
+from torch_geometric.utils import softmax
+
+
+class Set2Set(torch.nn.Module):
+    r"""The global pooling operator based on iterative content-based attention
+    from the `"Order Matters: Sequence to sequence for sets"
+    <https://arxiv.org/abs/1511.06391>`_ paper
+
+    .. math::
+        \mathbf{q}_t &= \mathrm{LSTM}(\mathbf{q}^{*}_{t-1})
+
+        \alpha_{i,t} &= \mathrm{softmax}(\mathbf{x}_i \cdot \mathbf{q}_t)
+
+        \mathbf{r}_t &= \sum_{i=1}^N \alpha_{i,t} \mathbf{x}_i
+
+        \mathbf{q}^{*}_t &= \mathbf{q}_t \, \Vert \, \mathbf{r}_t,
+
+    where :math:`\mathbf{q}^{*}_T` defines the output of the layer with twice
+    the dimensionality as the input.
+
+    Args:
+        in_channels (int): Size of each input sample.
+        processing_steps (int): Number of iterations :math:`T`.
+        num_layers (int, optional): Number of recurrent layers, *.e.g*, setting
+            :obj:`num_layers=2` would mean stacking two LSTMs together to form
+            a stacked LSTM, with the second LSTM taking in outputs of the first
+            LSTM and computing the final results. (default: :obj:`1`)
+    """
+
+    def __init__(self, in_channels, processing_steps, num_layers=1):
+        super(Set2Set, self).__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = 2 * in_channels
+        self.processing_steps = processing_steps
+        self.num_layers = num_layers
+
+        self.lstm = torch.nn.LSTM(self.out_channels, self.in_channels,
+                                  num_layers)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.lstm.reset_parameters()
+
+    def forward(self, x, batch):
+        """"""
+        batch_size = batch.max().item() + 1
+
+        h = (x.new_zeros((self.num_layers, batch_size, self.in_channels)),
+             x.new_zeros((self.num_layers, batch_size, self.in_channels)))
+        q_star = x.new_zeros(batch_size, self.out_channels)
+
+        for i in range(self.processing_steps):
+            q, h = self.lstm(q_star.unsqueeze(0), h)
+            q = q.view(batch_size, self.in_channels)
+            e = (x * q[batch]).sum(dim=-1, keepdim=True)
+            a = softmax(e, batch, num_nodes=batch_size)
+            r = scatter_add(a * x, batch, dim=0, dim_size=batch_size)
+            q_star = torch.cat([q, r], dim=-1)
+
+        return q_star
+
+    def __repr__(self):
+        return '{}({}, {})'.format(self.__class__.__name__, self.in_channels,
+                                   self.out_channels)
+from torch_scatter import scatter
+
+
+def global_add_pool(x, batch, size=None):
+    r"""Returns batch-wise graph-level-outputs by adding node features
+    across the node dimension, so that for a single graph
+    :math:`\mathcal{G}_i` its output is computed by
+
+    .. math::
+        \mathbf{r}_i = \sum_{n=1}^{N_i} \mathbf{x}_n
+
+    Args:
+        x (Tensor): Node feature matrix
+            :math:`\mathbf{X} \in \mathbb{R}^{(N_1 + \ldots + N_B) \times F}`.
+        batch (LongTensor): Batch vector :math:`\mathbf{b} \in {\{ 0, \ldots,
+            B-1\}}^N`, which assigns each node to a specific example.
+        size (int, optional): Batch-size :math:`B`.
+            Automatically calculated if not given. (default: :obj:`None`)
+
+    :rtype: :class:`Tensor`
+    """
+
+    size = batch.max().item() + 1 if size is None else size
+    return scatter(x, batch, dim=0, dim_size=size, reduce='add')
+
+
+def global_mean_pool(x, batch, size=None):
+    r"""Returns batch-wise graph-level-outputs by averaging node features
+    across the node dimension, so that for a single graph
+    :math:`\mathcal{G}_i` its output is computed by
+
+    .. math::
+        \mathbf{r}_i = \frac{1}{N_i} \sum_{n=1}^{N_i} \mathbf{x}_n
+
+    Args:
+        x (Tensor): Node feature matrix
+            :math:`\mathbf{X} \in \mathbb{R}^{(N_1 + \ldots + N_B) \times F}`.
+        batch (LongTensor): Batch vector :math:`\mathbf{b} \in {\{ 0, \ldots,
+            B-1\}}^N`, which assigns each node to a specific example.
+        size (int, optional): Batch-size :math:`B`.
+            Automatically calculated if not given. (default: :obj:`None`)
+
+    :rtype: :class:`Tensor`
+    """
+
+    size = batch.max().item() + 1 if size is None else size
+    return scatter(x, batch, dim=0, dim_size=size, reduce='mean')
+
+
+def global_max_pool(x, batch, size=None):
+    r"""Returns batch-wise graph-level-outputs by taking the channel-wise
+    maximum across the node dimension, so that for a single graph
+    :math:`\mathcal{G}_i` its output is computed by
+
+    .. math::
+        \mathbf{r}_i = \mathrm{max}_{n=1}^{N_i} \, \mathbf{x}_n
+
+    Args:
+        x (Tensor): Node feature matrix
+            :math:`\mathbf{X} \in \mathbb{R}^{(N_1 + \ldots + N_B) \times F}`.
+        batch (LongTensor): Batch vector :math:`\mathbf{b} \in {\{ 0, \ldots,
+            B-1\}}^N`, which assigns each node to a specific example.
+        size (int, optional): Batch-size :math:`B`.
+            Automatically calculated if not given. (default: :obj:`None`)
+
+    :rtype: :class:`Tensor`
+    """
+
+    size = batch.max().item() + 1 if size is None else size
+    return scatter(x, batch, dim=0, dim_size=size, reduce='max')
+import torch
+from torch_geometric.utils import to_dense_batch
+
+
+def global_sort_pool(x, batch, k):
+    r"""The global pooling operator from the `"An End-to-End Deep Learning
+    Architecture for Graph Classification"
+    <https://www.cse.wustl.edu/~muhan/papers/AAAI_2018_DGCNN.pdf>`_ paper,
+    where node features are sorted in descending order based on their last
+    feature channel. The first :math:`k` nodes form the output of the layer.
+
+    Args:
+        x (Tensor): Node feature matrix
+            :math:`\mathbf{X} \in \mathbb{R}^{N \times F}`.
+        batch (LongTensor): Batch vector :math:`\mathbf{b} \in {\{ 0, \ldots,
+            B-1\}}^N`, which assigns each node to a specific example.
+        k (int): The number of nodes to hold for each graph.
+
+    :rtype: :class:`Tensor`
+    """
+    fill_value = x.min().item() - 1
+    batch_x, _ = to_dense_batch(x, batch, fill_value)
+    B, N, D = batch_x.size()
+
+    _, perm = batch_x[:, :, -1].sort(dim=-1, descending=True)
+    arange = torch.arange(B, dtype=torch.long, device=perm.device) * N
+    perm = perm + arange.view(-1, 1)
+
+    batch_x = batch_x.view(B * N, D)
+    batch_x = batch_x[perm]
+    batch_x = batch_x.view(B, N, D)
+
+    if N >= k:
+        batch_x = batch_x[:, :k].contiguous()
+    else:
+        expand_batch_x = batch_x.new_full((B, k - N, D), fill_value)
+        batch_x = torch.cat([batch_x, expand_batch_x], dim=1)
+
+    batch_x[batch_x == fill_value] = 0
+    x = batch_x.view(B, k * D)
+
+    return x
+from .glob import global_add_pool, global_mean_pool, global_max_pool
+from .sort import global_sort_pool
+from .attention import GlobalAttention
+from .set2set import Set2Set
+
+__all__ = [
+    'global_add_pool',
+    'global_mean_pool',
+    'global_max_pool',
+    'global_sort_pool',
+    'GlobalAttention',
+    'Set2Set',
+]
+import torch
+import torch.nn.functional as F
+from torch.nn import Linear
+
+
+class DenseSAGEConv(torch.nn.Module):
+    r"""See :class:`torch_geometric.nn.conv.SAGEConv`.
+    """
+    def __init__(self, in_channels, out_channels, normalize=False, bias=True):
+        super(DenseSAGEConv, self).__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.normalize = normalize
+
+        self.lin_rel = Linear(in_channels, out_channels, bias=False)
+        self.lin_root = Linear(in_channels, out_channels, bias=bias)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.lin_rel.reset_parameters()
+        self.lin_root.reset_parameters()
+
+    def forward(self, x, adj, mask=None):
+        r"""
+        Args:
+            x (Tensor): Node feature tensor :math:`\mathbf{X} \in \mathbb{R}^{B
+                \times N \times F}`, with batch-size :math:`B`, (maximum)
+                number of nodes :math:`N` for each graph, and feature
+                dimension :math:`F`.
+            adj (Tensor): Adjacency tensor :math:`\mathbf{A} \in \mathbb{R}^{B
+                \times N \times N}`. The adjacency tensor is broadcastable in
+                the batch dimension, resulting in a shared adjacency matrix for
+                the complete batch.
+            mask (BoolTensor, optional): Mask matrix
+                :math:`\mathbf{M} \in {\{ 0, 1 \}}^{B \times N}` indicating
+                the valid nodes for each graph. (default: :obj:`None`)
+            add_loop (bool, optional): If set to :obj:`False`, the layer will
+                not automatically add self-loops to the adjacency matrices.
+                (default: :obj:`True`)
+        """
+        x = x.unsqueeze(0) if x.dim() == 2 else x
+        adj = adj.unsqueeze(0) if adj.dim() == 2 else adj
+        B, N, _ = adj.size()
+
+        out = torch.matmul(adj, x)
+        out = out / adj.sum(dim=-1, keepdim=True).clamp(min=1)
+        out = self.lin_rel(out) + self.lin_root(x)
+
+        if self.normalize:
+            out = F.normalize(out, p=2, dim=-1)
+
+        if mask is not None:
+            out = out * mask.view(B, N, 1).to(x.dtype)
+
+        return out
+
+    def __repr__(self):
+        return '{}({}, {})'.format(self.__class__.__name__, self.in_channels,
+                                   self.out_channels)
+import torch
+
+from ..inits import reset
+
+
+class DenseGINConv(torch.nn.Module):
+    r"""See :class:`torch_geometric.nn.conv.GINConv`.
+
+    :rtype: :class:`Tensor`
+    """
+    def __init__(self, nn, eps=0, train_eps=False):
+        super(DenseGINConv, self).__init__()
+
+        self.nn = nn
+        self.initial_eps = eps
+        if train_eps:
+            self.eps = torch.nn.Parameter(torch.Tensor([eps]))
+        else:
+            self.register_buffer('eps', torch.Tensor([eps]))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        reset(self.nn)
+        self.eps.data.fill_(self.initial_eps)
+
+    def forward(self, x, adj, mask=None, add_loop=True):
+        r"""
+        Args:
+            x (Tensor): Node feature tensor :math:`\mathbf{X} \in \mathbb{R}^{B
+                \times N \times F}`, with batch-size :math:`B`, (maximum)
+                number of nodes :math:`N` for each graph, and feature
+                dimension :math:`F`.
+            adj (Tensor): Adjacency tensor :math:`\mathbf{A} \in \mathbb{R}^{B
+                \times N \times N}`. The adjacency tensor is broadcastable in
+                the batch dimension, resulting in a shared adjacency matrix for
+                the complete batch.
+            mask (BoolTensor, optional): Mask matrix
+                :math:`\mathbf{M} \in {\{ 0, 1 \}}^{B \times N}` indicating
+                the valid nodes for each graph. (default: :obj:`None`)
+            add_loop (bool, optional): If set to :obj:`False`, the layer will
+                not automatically add self-loops to the adjacency matrices.
+                (default: :obj:`True`)
+        """
+        x = x.unsqueeze(0) if x.dim() == 2 else x
+        adj = adj.unsqueeze(0) if adj.dim() == 2 else adj
+        B, N, _ = adj.size()
+
+        out = torch.matmul(adj, x)
+        if add_loop:
+            out = (1 + self.eps) * x + out
+
+        out = self.nn(out)
+
+        if mask is not None:
+            out = out * mask.view(B, N, 1).to(x.dtype)
+
+        return out
+
+    def __repr__(self):
+        return '{}(nn={})'.format(self.__class__.__name__, self.nn)
+import torch
+from torch.nn import Parameter
+
+from ..inits import uniform
+
+
+class DenseGraphConv(torch.nn.Module):
+    r"""See :class:`torch_geometric.nn.conv.GraphConv`.
+    """
+    def __init__(self, in_channels, out_channels, aggr='add', bias=True):
+        assert aggr in ['add', 'mean', 'max']
+        super(DenseGraphConv, self).__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.aggr = aggr
+
+        self.weight = Parameter(torch.Tensor(in_channels, out_channels))
+        self.lin = torch.nn.Linear(in_channels, out_channels, bias=bias)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        uniform(self.in_channels, self.weight)
+        self.lin.reset_parameters()
+
+    def forward(self, x, adj, mask=None):
+        r"""
+        Args:
+            x (Tensor): Node feature tensor :math:`\mathbf{X} \in \mathbb{R}^{B
+                \times N \times F}`, with batch-size :math:`B`, (maximum)
+                number of nodes :math:`N` for each graph, and feature
+                dimension :math:`F`.
+            adj (Tensor): Adjacency tensor :math:`\mathbf{A} \in \mathbb{R}^{B
+                \times N \times N}`. The adjacency tensor is broadcastable in
+                the batch dimension, resulting in a shared adjacency matrix for
+                the complete batch.
+            mask (BoolTensor, optional): Mask matrix
+                :math:`\mathbf{M} \in {\{ 0, 1 \}}^{B \times N}` indicating
+                the valid nodes for each graph. (default: :obj:`None`)
+        """
+        x = x.unsqueeze(0) if x.dim() == 2 else x
+        adj = adj.unsqueeze(0) if adj.dim() == 2 else adj
+        B, N, _ = adj.size()
+
+        out = torch.matmul(adj, x)
+        out = torch.matmul(out, self.weight)
+
+        if self.aggr == 'mean':
+            out = out / adj.sum(dim=-1, keepdim=True).clamp(min=1)
+        elif self.aggr == 'max':
+            out = out.max(dim=-1)[0]
+
+        out = out + self.lin(x)
+
+        if mask is not None:
+            out = out * mask.view(B, N, 1).to(x.dtype)
+
+        return out
+
+    def __repr__(self):
+        return '{}({}, {})'.format(self.__class__.__name__, self.in_channels,
+                                   self.out_channels)
+from .dense_sage_conv import DenseSAGEConv
+from .dense_gcn_conv import DenseGCNConv
+from .dense_graph_conv import DenseGraphConv
+from .dense_gin_conv import DenseGINConv
+from .diff_pool import dense_diff_pool
+from .mincut_pool import dense_mincut_pool
+
+__all__ = [
+    'DenseGCNConv',
+    'DenseSAGEConv',
+    'DenseGraphConv',
+    'DenseGINConv',
+    'dense_diff_pool',
+    'dense_mincut_pool',
+]
+import torch
+from torch.nn import Parameter
+
+from ..inits import glorot, zeros
+
+
+class DenseGCNConv(torch.nn.Module):
+    r"""See :class:`torch_geometric.nn.conv.GCNConv`.
+    """
+    def __init__(self, in_channels, out_channels, improved=False, bias=True):
+        super(DenseGCNConv, self).__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.improved = improved
+
+        self.weight = Parameter(torch.Tensor(self.in_channels, out_channels))
+
+        if bias:
+            self.bias = Parameter(torch.Tensor(out_channels))
+        else:
+            self.register_parameter('bias', None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        glorot(self.weight)
+        zeros(self.bias)
+
+    def forward(self, x, adj, mask=None, add_loop=True):
+        r"""
+        Args:
+            x (Tensor): Node feature tensor :math:`\mathbf{X} \in \mathbb{R}^{B
+                \times N \times F}`, with batch-size :math:`B`, (maximum)
+                number of nodes :math:`N` for each graph, and feature
+                dimension :math:`F`.
+            adj (Tensor): Adjacency tensor :math:`\mathbf{A} \in \mathbb{R}^{B
+                \times N \times N}`. The adjacency tensor is broadcastable in
+                the batch dimension, resulting in a shared adjacency matrix for
+                the complete batch.
+            mask (BoolTensor, optional): Mask matrix
+                :math:`\mathbf{M} \in {\{ 0, 1 \}}^{B \times N}` indicating
+                the valid nodes for each graph. (default: :obj:`None`)
+            add_loop (bool, optional): If set to :obj:`False`, the layer will
+                not automatically add self-loops to the adjacency matrices.
+                (default: :obj:`True`)
+        """
+        x = x.unsqueeze(0) if x.dim() == 2 else x
+        adj = adj.unsqueeze(0) if adj.dim() == 2 else adj
+        B, N, _ = adj.size()
+
+        if add_loop:
+            adj = adj.clone()
+            idx = torch.arange(N, dtype=torch.long, device=adj.device)
+            adj[:, idx, idx] = 1 if not self.improved else 2
+
+        out = torch.matmul(x, self.weight)
+        deg_inv_sqrt = adj.sum(dim=-1).clamp(min=1).pow(-0.5)
+
+        adj = deg_inv_sqrt.unsqueeze(-1) * adj * deg_inv_sqrt.unsqueeze(-2)
+        out = torch.matmul(adj, out)
+
+        if self.bias is not None:
+            out = out + self.bias
+
+        if mask is not None:
+            out = out * mask.view(B, N, 1).to(x.dtype)
+
+        return out
+
+    def __repr__(self):
+        return '{}({}, {})'.format(self.__class__.__name__, self.in_channels,
+                                   self.out_channels)
+import torch
+
+EPS = 1e-15
+
+
+def dense_mincut_pool(x, adj, s, mask=None):
+    r"""MinCUt pooling operator from the `"Mincut Pooling in Graph Neural
+    Networks" <https://arxiv.org/abs/1907.00481>`_ paper
+
+    .. math::
+        \mathbf{X}^{\prime} &= {\mathrm{softmax}(\mathbf{S})}^{\top} \cdot
+        \mathbf{X}
+
+        \mathbf{A}^{\prime} &= {\mathrm{softmax}(\mathbf{S})}^{\top} \cdot
+        \mathbf{A} \cdot \mathrm{softmax}(\mathbf{S})
+
+    based on dense learned assignments :math:`\mathbf{S} \in \mathbb{R}^{B
+    \times N \times C}`.
+    Returns pooled node feature matrix, coarsened symmetrically normalized
+    adjacency matrix and two auxiliary objectives: (1) The minCUT loss
+
+    .. math::
+        \mathcal{L}_c = - \frac{\mathrm{Tr}(\mathbf{S}^{\top} \mathbf{A}
+        \mathbf{S})} {\mathrm{Tr}(\mathbf{S}^{\top} \mathbf{D}
+        \mathbf{S})}
+
+    where :math:`\mathbf{D}` is the degree matrix, and (2) the orthogonality
+    loss
+
+    .. math::
+        \mathcal{L}_o = {\left\| \frac{\mathbf{S}^{\top} \mathbf{S}}
+        {{\|\mathbf{S}^{\top} \mathbf{S}\|}_F} -\frac{\mathbf{I}_C}{\sqrt{C}}
+        \right\|}_F.
+
+    Args:
+        x (Tensor): Node feature tensor :math:`\mathbf{X} \in \mathbb{R}^{B
+            \times N \times F}` with batch-size :math:`B`, (maximum)
+            number of nodes :math:`N` for each graph, and feature dimension
+            :math:`F`.
+        adj (Tensor): Symmetrically normalized adjacency tensor
+            :math:`\mathbf{A} \in \mathbb{R}^{B \times N \times N}`.
+        s (Tensor): Assignment tensor :math:`\mathbf{S} \in \mathbb{R}^{B
+            \times N \times C}` with number of clusters :math:`C`. The softmax
+            does not have to be applied beforehand, since it is executed
+            within this method.
+        mask (BoolTensor, optional): Mask matrix
+            :math:`\mathbf{M} \in {\{ 0, 1 \}}^{B \times N}` indicating
+            the valid nodes for each graph. (default: :obj:`None`)
+
+    :rtype: (:class:`Tensor`, :class:`Tensor`, :class:`Tensor`,
+        :class:`Tensor`)
+    """
+
+    x = x.unsqueeze(0) if x.dim() == 2 else x
+    adj = adj.unsqueeze(0) if adj.dim() == 2 else adj
+    s = s.unsqueeze(0) if s.dim() == 2 else s
+
+    (batch_size, num_nodes, _), k = x.size(), s.size(-1)
+
+    s = torch.softmax(s, dim=-1)
+
+    if mask is not None:
+        mask = mask.view(batch_size, num_nodes, 1).to(x.dtype)
+        x, s = x * mask, s * mask
+
+    out = torch.matmul(s.transpose(1, 2), x)
+    out_adj = torch.matmul(torch.matmul(s.transpose(1, 2), adj), s)
+
+    # MinCUT regularization.
+    mincut_num = _rank3_trace(out_adj)
+    d_flat = torch.einsum('ijk->ij', adj)
+    d = _rank3_diag(d_flat)
+    mincut_den = _rank3_trace(
+        torch.matmul(torch.matmul(s.transpose(1, 2), d), s))
+    mincut_loss = -(mincut_num / mincut_den)
+    mincut_loss = torch.mean(mincut_loss)
+
+    # Orthogonality regularization.
+    ss = torch.matmul(s.transpose(1, 2), s)
+    i_s = torch.eye(k).type_as(ss)
+    ortho_loss = torch.norm(
+        ss / torch.norm(ss, dim=(-1, -2), keepdim=True) -
+        i_s / torch.norm(i_s), dim=(-1, -2))
+    ortho_loss = torch.mean(ortho_loss)
+
+    # Fix and normalize coarsened adjacency matrix.
+    ind = torch.arange(k, device=out_adj.device)
+    out_adj[:, ind, ind] = 0
+    d = torch.einsum('ijk->ij', out_adj)
+    d = torch.sqrt(d)[:, None] + EPS
+    out_adj = (out_adj / d) / d.transpose(1, 2)
+
+    return out, out_adj, mincut_loss, ortho_loss
+
+
+def _rank3_trace(x):
+    return torch.einsum('ijj->i', x)
+
+
+def _rank3_diag(x):
+    eye = torch.eye(x.size(1)).type_as(x)
+    out = eye * x.unsqueeze(2).expand(*x.size(), x.size(1))
+    return out
+import torch
+
+EPS = 1e-15
+
+
+def dense_diff_pool(x, adj, s, mask=None):
+    r"""Differentiable pooling operator from the `"Hierarchical Graph
+    Representation Learning with Differentiable Pooling"
+    <https://arxiv.org/abs/1806.08804>`_ paper
+
+    .. math::
+        \mathbf{X}^{\prime} &= {\mathrm{softmax}(\mathbf{S})}^{\top} \cdot
+        \mathbf{X}
+
+        \mathbf{A}^{\prime} &= {\mathrm{softmax}(\mathbf{S})}^{\top} \cdot
+        \mathbf{A} \cdot \mathrm{softmax}(\mathbf{S})
+
+    based on dense learned assignments :math:`\mathbf{S} \in \mathbb{R}^{B
+    \times N \times C}`.
+    Returns pooled node feature matrix, coarsened adjacency matrix and two
+    auxiliary objectives: (1) The link prediction loss
+
+    .. math::
+        \mathcal{L}_{LP} = {\| \mathbf{A} -
+        \mathrm{softmax}(\mathbf{S}) {\mathrm{softmax}(\mathbf{S})}^{\top}
+        \|}_F,
+
+    and the entropy regularization
+
+    .. math::
+        \mathcal{L}_E = \frac{1}{N} \sum_{n=1}^N H(\mathbf{S}_n).
+
+    Args:
+        x (Tensor): Node feature tensor :math:`\mathbf{X} \in \mathbb{R}^{B
+            \times N \times F}` with batch-size :math:`B`, (maximum)
+            number of nodes :math:`N` for each graph, and feature dimension
+            :math:`F`.
+        adj (Tensor): Adjacency tensor :math:`\mathbf{A} \in \mathbb{R}^{B
+            \times N \times N}`.
+        s (Tensor): Assignment tensor :math:`\mathbf{S} \in \mathbb{R}^{B
+            \times N \times C}` with number of clusters :math:`C`. The softmax
+            does not have to be applied beforehand, since it is executed
+            within this method.
+        mask (BoolTensor, optional): Mask matrix
+            :math:`\mathbf{M} \in {\{ 0, 1 \}}^{B \times N}` indicating
+            the valid nodes for each graph. (default: :obj:`None`)
+
+    :rtype: (:class:`Tensor`, :class:`Tensor`, :class:`Tensor`,
+        :class:`Tensor`)
+    """
+
+    x = x.unsqueeze(0) if x.dim() == 2 else x
+    adj = adj.unsqueeze(0) if adj.dim() == 2 else adj
+    s = s.unsqueeze(0) if s.dim() == 2 else s
+
+    batch_size, num_nodes, _ = x.size()
+
+    s = torch.softmax(s, dim=-1)
+
+    if mask is not None:
+        mask = mask.view(batch_size, num_nodes, 1).to(x.dtype)
+        x, s = x * mask, s * mask
+
+    out = torch.matmul(s.transpose(1, 2), x)
+    out_adj = torch.matmul(torch.matmul(s.transpose(1, 2), adj), s)
+
+    link_loss = adj - torch.matmul(s, s.transpose(1, 2))
+    link_loss = torch.norm(link_loss, p=2)
+    link_loss = link_loss / adj.numel()
+
+    ent_loss = (-s * torch.log(s + EPS)).sum(dim=-1).mean()
+
+    return out, out_adj, link_loss, ent_loss
+import torch
+from torch.nn import Embedding
+from torch.utils.data import DataLoader
+from torch_sparse import SparseTensor
+from sklearn.linear_model import LogisticRegression
+
+from torch_geometric.utils.num_nodes import maybe_num_nodes
+
+try:
+    import torch_cluster  # noqa
+    random_walk = torch.ops.torch_cluster.random_walk
+except ImportError:
+    random_walk = None
+
+EPS = 1e-15
+
+
+class Node2Vec(torch.nn.Module):
+    r"""The Node2Vec model from the
+    `"node2vec: Scalable Feature Learning for Networks"
+    <https://arxiv.org/abs/1607.00653>`_ paper where random walks of
+    length :obj:`walk_length` are sampled in a given graph, and node embeddings
+    are learned via negative sampling optimization.
+
+    .. note::
+
+        For an example of using Node2Vec, see `examples/node2vec.py
+        <https://github.com/rusty1s/pytorch_geometric/blob/master/examples/
+        node2vec.py>`_.
+
+    Args:
+        edge_index (LongTensor): The edge indices.
+        embedding_dim (int): The size of each embedding vector.
+        walk_length (int): The walk length.
+        context_size (int): The actual context size which is considered for
+            positive samples. This parameter increases the effective sampling
+            rate by reusing samples across different source nodes.
+        walks_per_node (int, optional): The number of walks to sample for each
+            node. (default: :obj:`1`)
+        p (float, optional): Likelihood of immediately revisiting a node in the
+            walk. (default: :obj:`1`)
+        q (float, optional): Control parameter to interpolate between
+            breadth-first strategy and depth-first strategy (default: :obj:`1`)
+        num_negative_samples (int, optional): The number of negative samples to
+            use for each positive sample. (default: :obj:`1`)
+        num_nodes (int, optional): The number of nodes. (default: :obj:`None`)
+        sparse (bool, optional): If set to :obj:`True`, gradients w.r.t. to the
+            weight matrix will be sparse. (default: :obj:`False`)
+    """
+    def __init__(self, edge_index, embedding_dim, walk_length, context_size,
+                 walks_per_node=1, p=1, q=1, num_negative_samples=1,
+                 num_nodes=None, sparse=False):
+        super(Node2Vec, self).__init__()
+
+        if random_walk is None:
+            raise ImportError('`Node2Vec` requires `torch-cluster`.')
+
+        N = maybe_num_nodes(edge_index, num_nodes)
+        row, col = edge_index
+        self.adj = SparseTensor(row=row, col=col, sparse_sizes=(N, N))
+        self.adj = self.adj.to('cpu')
+
+        assert walk_length >= context_size
+
+        self.embedding_dim = embedding_dim
+        self.walk_length = walk_length - 1
+        self.context_size = context_size
+        self.walks_per_node = walks_per_node
+        self.p = p
+        self.q = q
+        self.num_negative_samples = num_negative_samples
+
+        self.embedding = Embedding(N, embedding_dim, sparse=sparse)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.embedding.reset_parameters()
+
+    def forward(self, batch=None):
+        """Returns the embeddings for the nodes in :obj:`batch`."""
+        emb = self.embedding.weight
+        return emb if batch is None else emb[batch]
+
+    def loader(self, **kwargs):
+        return DataLoader(range(self.adj.sparse_size(0)),
+                          collate_fn=self.sample, **kwargs)
+
+    def pos_sample(self, batch):
+        batch = batch.repeat(self.walks_per_node)
+        rowptr, col, _ = self.adj.csr()
+        rw = random_walk(rowptr, col, batch, self.walk_length, self.p, self.q)
+
+        walks = []
+        num_walks_per_rw = 1 + self.walk_length + 1 - self.context_size
+        for j in range(num_walks_per_rw):
+            walks.append(rw[:, j:j + self.context_size])
+        return torch.cat(walks, dim=0)
+
+    def neg_sample(self, batch):
+        batch = batch.repeat(self.walks_per_node * self.num_negative_samples)
+
+        rw = torch.randint(self.adj.sparse_size(0),
+                           (batch.size(0), self.walk_length))
+        rw = torch.cat([batch.view(-1, 1), rw], dim=-1)
+
+        walks = []
+        num_walks_per_rw = 1 + self.walk_length + 1 - self.context_size
+        for j in range(num_walks_per_rw):
+            walks.append(rw[:, j:j + self.context_size])
+        return torch.cat(walks, dim=0)
+
+    def sample(self, batch):
+        if not isinstance(batch, torch.Tensor):
+            batch = torch.tensor(batch)
+        return self.pos_sample(batch), self.neg_sample(batch)
+
+    def loss(self, pos_rw, neg_rw):
+        r"""Computes the loss given positive and negative random walks."""
+
+        # Positive loss.
+        start, rest = pos_rw[:, 0], pos_rw[:, 1:].contiguous()
+
+        h_start = self.embedding(start).view(pos_rw.size(0), 1,
+                                             self.embedding_dim)
+        h_rest = self.embedding(rest.view(-1)).view(pos_rw.size(0), -1,
+                                                    self.embedding_dim)
+
+        out = (h_start * h_rest).sum(dim=-1).view(-1)
+        pos_loss = -torch.log(torch.sigmoid(out) + EPS).mean()
+
+        # Negative loss.
+        start, rest = neg_rw[:, 0], neg_rw[:, 1:].contiguous()
+
+        h_start = self.embedding(start).view(neg_rw.size(0), 1,
+                                             self.embedding_dim)
+        h_rest = self.embedding(rest.view(-1)).view(neg_rw.size(0), -1,
+                                                    self.embedding_dim)
+
+        out = (h_start * h_rest).sum(dim=-1).view(-1)
+        neg_loss = -torch.log(1 - torch.sigmoid(out) + EPS).mean()
+
+        return pos_loss + neg_loss
+
+    def test(self, train_z, train_y, test_z, test_y, solver='lbfgs',
+             multi_class='auto', *args, **kwargs):
+        r"""Evaluates latent space quality via a logistic regression downstream
+        task."""
+        clf = LogisticRegression(solver=solver, multi_class=multi_class, *args,
+                                 **kwargs).fit(train_z.detach().cpu().numpy(),
+                                               train_y.detach().cpu().numpy())
+        return clf.score(test_z.detach().cpu().numpy(),
+                         test_y.detach().cpu().numpy())
+
+    def __repr__(self):
+        return '{}({}, {})'.format(self.__class__.__name__,
+                                   self.embedding.weight.size(0),
+                                   self.embedding.weight.size(1))
+import os
+import os.path as osp
+from math import pi as PI
+import warnings
+
+import ase
+import torch
+import torch.nn.functional as F
+from torch.nn import Embedding, Sequential, Linear, ModuleList
+import numpy as np
+
+from torch_scatter import scatter
+from torch_geometric.data.makedirs import makedirs
+from torch_geometric.data import download_url, extract_zip
+from torch_geometric.nn import radius_graph, MessagePassing
+
+try:
+    import schnetpack as spk
+except ImportError:
+    spk = None
+
+qm9_target_dict = {
+    0: 'dipole_moment',
+    1: 'isotropic_polarizability',
+    2: 'homo',
+    3: 'lumo',
+    4: 'gap',
+    5: 'electronic_spatial_extent',
+    6: 'zpve',
+    7: 'energy_U0',
+    8: 'energy_U',
+    9: 'enthalpy_H',
+    10: 'free_energy',
+    11: 'heat_capacity',
+}
+
+
+class SchNet(torch.nn.Module):
+    r"""The continuous-filter convolutional neural network SchNet from the
+    `"SchNet: A Continuous-filter Convolutional Neural Network for Modeling
+    Quantum Interactions" <https://arxiv.org/abs/1706.08566>`_ paper that uses
+    the interactions blocks of the form
+
+    .. math::
+        \mathbf{x}^{\prime}_i = \sum_{j \in \mathcal{N}(i)} \mathbf{x}_j \odot
+        h_{\mathbf{\Theta}} ( \exp(-\gamma(\mathbf{e}_{j,i} - \mathbf{\mu}))),
+
+    here :math:`h_{\mathbf{\Theta}}` denotes an MLP and
+    :math:`\mathbf{e}_{j,i}` denotes the interatomic distances between atoms.
+
+    .. note::
+
+        For an example of using a pretrained SchNet variant, see
+        `examples/qm9_pretrained_schnet.py
+        <https://github.com/rusty1s/pytorch_geometric/blob/master/examples/
+        qm9_pretrained_schnet.py>`_.
+
+    Args:
+        hidden_channels (int, optional): Hidden embedding size.
+            (default: :obj:`128`)
+        num_filters (int, optional): The number of filters to use.
+            (default: :obj:`128`)
+        num_interactions (int, optional): The number of interaction blocks.
+            (default: :obj:`6`)
+        num_gaussians (int, optional): The number of gaussians :math:`\mu`.
+            (default: :obj:`50`)
+        cutoff (float, optional): Cutoff distance for interatomic interactions.
+            (default: :obj:`10.0`)
+        readout (string, optional): Whether to apply :obj:`"add"` or
+            :obj:`"mean"` global aggregation. (default: :obj:`"add"`)
+        dipole (bool, optional): If set to :obj:`True`, will use the magnitude
+            of the dipole moment to make the final prediction, *e.g.*, for
+            target 0 of :class:`torch_geometric.datasets.QM9`.
+            (default: :obj:`False`)
+        mean (float, optional): The mean of the property to predict.
+            (default: :obj:`None`)
+        std (float, optional): The standard deviation of the property to
+            predict. (default: :obj:`None`)
+        atomref (torch.Tensor, optional): The reference of single-atom
+            properties.
+            Expects a vector of shape :obj:`(max_atomic_number, )`.
+    """
+
+    url = 'http://www.quantum-machine.org/datasets/trained_schnet_models.zip'
+
+    def __init__(self, hidden_channels=128, num_filters=128,
+                 num_interactions=6, num_gaussians=50, cutoff=10.0,
+                 readout='add', dipole=False, mean=None, std=None,
+                 atomref=None):
+        super(SchNet, self).__init__()
+
+        assert readout in ['add', 'sum', 'mean']
+
+        self.hidden_channels = hidden_channels
+        self.num_filters = num_filters
+        self.num_interactions = num_interactions
+        self.num_gaussians = num_gaussians
+        self.cutoff = cutoff
+        self.readout = readout
+        self.dipole = dipole
+        self.readout = 'add' if self.dipole else self.readout
+        self.mean = mean
+        self.std = std
+        self.scale = None
+
+        atomic_mass = torch.from_numpy(ase.data.atomic_masses)
+        self.register_buffer('atomic_mass', atomic_mass)
+
+        self.embedding = Embedding(100, hidden_channels)
+        self.distance_expansion = GaussianSmearing(0.0, cutoff, num_gaussians)
+
+        self.interactions = ModuleList()
+        for _ in range(num_interactions):
+            block = InteractionBlock(hidden_channels, num_gaussians,
+                                     num_filters, cutoff)
+            self.interactions.append(block)
+
+        self.lin1 = Linear(hidden_channels, hidden_channels // 2)
+        self.act = ShiftedSoftplus()
+        self.lin2 = Linear(hidden_channels // 2, 1)
+
+        self.register_buffer('initial_atomref', atomref)
+        self.atomref = None
+        if atomref is not None:
+            self.atomref = Embedding(100, 1)
+            self.atomref.weight.data.copy_(atomref)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.embedding.reset_parameters()
+        for interaction in self.interactions:
+            interaction.reset_parameters()
+        torch.nn.init.xavier_uniform_(self.lin1.weight)
+        self.lin1.bias.data.fill_(0)
+        torch.nn.init.xavier_uniform_(self.lin2.weight)
+        self.lin2.bias.data.fill_(0)
+        if self.atomref is not None:
+            self.atomref.weight.data.copy_(self.initial_atomref)
+
+    @staticmethod
+    def from_qm9_pretrained(root, dataset, target):
+        if spk is None:
+            raise ImportError(
+                '`SchNet.from_qm9_pretrained` requires `schnetpack`.')
+
+        assert target >= 0 and target <= 12
+
+        units = [1] * 12
+        units[0] = ase.units.Debye
+        units[1] = ase.units.Bohr**3
+        units[5] = ase.units.Bohr**2
+
+        root = osp.expanduser(osp.normpath(root))
+        makedirs(root)
+        folder = 'trained_schnet_models'
+        if not osp.exists(osp.join(root, folder)):
+            path = download_url(SchNet.url, root)
+            extract_zip(path, root)
+            os.unlink(path)
+
+        name = f'qm9_{qm9_target_dict[target]}'
+        path = osp.join(root, 'trained_schnet_models', name, 'split.npz')
+
+        split = np.load(path)
+        train_idx = split['train_idx']
+        val_idx = split['val_idx']
+        test_idx = split['test_idx']
+
+        # Filter the splits to only contain characterized molecules.
+        idx = dataset.data.idx
+        assoc = idx.new_empty(idx.max().item() + 1)
+        assoc[idx] = torch.arange(idx.size(0))
+
+        train_idx = assoc[train_idx[np.isin(train_idx, idx)]]
+        val_idx = assoc[val_idx[np.isin(val_idx, idx)]]
+        test_idx = assoc[test_idx[np.isin(test_idx, idx)]]
+
+        path = osp.join(root, 'trained_schnet_models', name, 'best_model')
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore')
+            state = torch.load(path, map_location='cpu')
+
+        net = SchNet(hidden_channels=128, num_filters=128, num_interactions=6,
+                     num_gaussians=50, cutoff=10.0,
+                     atomref=dataset.atomref(target))
+
+        net.embedding.weight = state.representation.embedding.weight
+
+        for int1, int2 in zip(state.representation.interactions,
+                              net.interactions):
+            int2.mlp[0].weight = int1.filter_network[0].weight
+            int2.mlp[0].bias = int1.filter_network[0].bias
+            int2.mlp[2].weight = int1.filter_network[1].weight
+            int2.mlp[2].bias = int1.filter_network[1].bias
+            int2.lin.weight = int1.dense.weight
+            int2.lin.bias = int1.dense.bias
+
+            int2.conv.lin1.weight = int1.cfconv.in2f.weight
+            int2.conv.lin2.weight = int1.cfconv.f2out.weight
+            int2.conv.lin2.bias = int1.cfconv.f2out.bias
+
+        net.lin1.weight = state.output_modules[0].out_net[1].out_net[0].weight
+        net.lin1.bias = state.output_modules[0].out_net[1].out_net[0].bias
+        net.lin2.weight = state.output_modules[0].out_net[1].out_net[1].weight
+        net.lin2.bias = state.output_modules[0].out_net[1].out_net[1].bias
+
+        mean = state.output_modules[0].atom_pool.average
+        net.readout = 'mean' if mean is True else 'add'
+
+        dipole = state.output_modules[0].__class__.__name__ == 'DipoleMoment'
+        net.dipole = dipole
+
+        net.mean = state.output_modules[0].standardize.mean.item()
+        net.std = state.output_modules[0].standardize.stddev.item()
+
+        if state.output_modules[0].atomref is not None:
+            net.atomref.weight = state.output_modules[0].atomref.weight
+        else:
+            net.atomref = None
+
+        net.scale = 1. / units[target]
+
+        return net, (dataset[train_idx], dataset[val_idx], dataset[test_idx])
+
+    def forward(self, z, pos, batch=None):
+        assert z.dim() == 1 and z.dtype == torch.long
+        batch = torch.zeros_like(z) if batch is None else batch
+
+        h = self.embedding(z)
+
+        edge_index = radius_graph(pos, r=self.cutoff, batch=batch)
+        row, col = edge_index
+        edge_weight = (pos[row] - pos[col]).norm(dim=-1)
+        edge_attr = self.distance_expansion(edge_weight)
+
+        for interaction in self.interactions:
+            h = h + interaction(h, edge_index, edge_weight, edge_attr)
+
+        h = self.lin1(h)
+        h = self.act(h)
+        h = self.lin2(h)
+
+        if self.dipole:
+            # Get center of mass.
+            mass = self.atomic_mass[z].view(-1, 1)
+            c = scatter(mass * pos, batch, dim=0) / scatter(mass, batch, dim=0)
+            h = h * (pos - c[batch])
+
+        if not self.dipole and self.mean is not None and self.std is not None:
+            h = h * self.std + self.mean
+
+        if not self.dipole and self.atomref is not None:
+            h = h + self.atomref(z)
+
+        out = scatter(h, batch, dim=0, reduce=self.readout)
+
+        if self.dipole:
+            out = torch.norm(out, dim=-1, keepdim=True)
+
+        if self.scale is not None:
+            out = self.scale * out
+
+        return out
+
+    def __repr__(self):
+        return (f'{self.__class__.__name__}('
+                f'hidden_channels={self.hidden_channels}, '
+                f'num_filters={self.num_filters}, '
+                f'num_interactions={self.num_interactions}, '
+                f'num_gaussians={self.num_gaussians}, '
+                f'cutoff={self.cutoff})')
+
+
+class InteractionBlock(torch.nn.Module):
+    def __init__(self, hidden_channels, num_gaussians, num_filters, cutoff):
+        super(InteractionBlock, self).__init__()
+        self.mlp = Sequential(
+            Linear(num_gaussians, num_filters),
+            ShiftedSoftplus(),
+            Linear(num_filters, num_filters),
+        )
+        self.conv = CFConv(hidden_channels, hidden_channels, num_filters,
+                           self.mlp, cutoff)
+        self.act = ShiftedSoftplus()
+        self.lin = Linear(hidden_channels, hidden_channels)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.xavier_uniform_(self.mlp[0].weight)
+        self.mlp[0].bias.data.fill_(0)
+        torch.nn.init.xavier_uniform_(self.mlp[2].weight)
+        self.mlp[0].bias.data.fill_(0)
+        self.conv.reset_parameters()
+        torch.nn.init.xavier_uniform_(self.lin.weight)
+        self.lin.bias.data.fill_(0)
+
+    def forward(self, x, edge_index, edge_weight, edge_attr):
+        x = self.conv(x, edge_index, edge_weight, edge_attr)
+        x = self.act(x)
+        x = self.lin(x)
+        return x
+
+
+class CFConv(MessagePassing):
+    def __init__(self, in_channels, out_channels, num_filters, nn, cutoff):
+        super(CFConv, self).__init__(aggr='add')
+        self.lin1 = Linear(in_channels, num_filters, bias=False)
+        self.lin2 = Linear(num_filters, out_channels)
+        self.nn = nn
+        self.cutoff = cutoff
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.xavier_uniform_(self.lin1.weight)
+        torch.nn.init.xavier_uniform_(self.lin2.weight)
+        self.lin2.bias.data.fill_(0)
+
+    def forward(self, x, edge_index, edge_weight, edge_attr):
+        C = 0.5 * (torch.cos(edge_weight * PI / self.cutoff) + 1.0)
+        W = self.nn(edge_attr) * C.view(-1, 1)
+
+        x = self.lin1(x)
+        x = self.propagate(edge_index, x=x, W=W)
+        x = self.lin2(x)
+        return x
+
+    def message(self, x_j, W):
+        return x_j * W
+
+
+class GaussianSmearing(torch.nn.Module):
+    def __init__(self, start=0.0, stop=5.0, num_gaussians=50):
+        super(GaussianSmearing, self).__init__()
+        offset = torch.linspace(start, stop, num_gaussians)
+        self.coeff = -0.5 / (offset[1] - offset[0]).item()**2
+        self.register_buffer('offset', offset)
+
+    def forward(self, dist):
+        dist = dist.view(-1, 1) - self.offset.view(1, -1)
+        return torch.exp(self.coeff * torch.pow(dist, 2))
+
+
+class ShiftedSoftplus(torch.nn.Module):
+    def __init__(self):
+        super(ShiftedSoftplus, self).__init__()
+        self.shift = torch.log(torch.tensor(2.0)).item()
+
+    def forward(self, x):
+        return F.softplus(x) - self.shift
+from math import sqrt
+
+import torch
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import networkx as nx
+from torch_geometric.nn import MessagePassing
+from torch_geometric.data import Data
+from torch_geometric.utils import k_hop_subgraph, to_networkx
+
+EPS = 1e-15
+
+
+class GNNExplainer(torch.nn.Module):
+    r"""The GNN-Explainer model from the `"GNNExplainer: Generating
+    Explanations for Graph Neural Networks"
+    <https://arxiv.org/abs/1903.03894>`_ paper for identifying compact subgraph
+    structures and small subsets node features that play a crucial role in a
+    GNN’s node-predictions.
+
+    .. note::
+
+        For an example of using GNN-Explainer, see `examples/gnn_explainer.py
+        <https://github.com/rusty1s/pytorch_geometric/blob/master/examples/
+        gnn_explainer.py>`_.
+
+    Args:
+        model (torch.nn.Module): The GNN module to explain.
+        epochs (int, optional): The number of epochs to train.
+            (default: :obj:`100`)
+        lr (float, optional): The learning rate to apply.
+            (default: :obj:`0.01`)
+        log (bool, optional): If set to :obj:`False`, will not log any learning
+            progress. (default: :obj:`True`)
+    """
+
+    coeffs = {
+        'edge_size': 0.005,
+        'node_feat_size': 1.0,
+        'edge_ent': 1.0,
+        'node_feat_ent': 0.1,
+    }
+
+    def __init__(self, model, epochs=100, lr=0.01, log=True):
+        super(GNNExplainer, self).__init__()
+        self.model = model
+        self.epochs = epochs
+        self.lr = lr
+        self.log = log
+
+    def __set_masks__(self, x, edge_index, init="normal"):
+        (N, F), E = x.size(), edge_index.size(1)
+
+        std = 0.1
+        self.node_feat_mask = torch.nn.Parameter(torch.randn(F) * 0.1)
+
+        std = torch.nn.init.calculate_gain('relu') * sqrt(2.0 / (2 * N))
+        self.edge_mask = torch.nn.Parameter(torch.randn(E) * std)
+
+        for module in self.model.modules():
+            if isinstance(module, MessagePassing):
+                module.__explain__ = True
+                module.__edge_mask__ = self.edge_mask
+
+    def __clear_masks__(self):
+        for module in self.model.modules():
+            if isinstance(module, MessagePassing):
+                module.__explain__ = False
+                module.__edge_mask__ = None
+        self.node_feat_masks = None
+        self.edge_mask = None
+
+    def __num_hops__(self):
+        num_hops = 0
+        for module in self.model.modules():
+            if isinstance(module, MessagePassing):
+                num_hops += 1
+        return num_hops
+
+    def __flow__(self):
+        for module in self.model.modules():
+            if isinstance(module, MessagePassing):
+                return module.flow
+        return 'source_to_target'
+
+    def __subgraph__(self, node_idx, x, edge_index, **kwargs):
+        num_nodes, num_edges = x.size(0), edge_index.size(1)
+
+        subset, edge_index, mapping, edge_mask = k_hop_subgraph(
+            node_idx, self.__num_hops__(), edge_index, relabel_nodes=True,
+            num_nodes=num_nodes, flow=self.__flow__())
+
+        x = x[subset]
+        for key, item in kwargs:
+            if torch.is_tensor(item) and item.size(0) == num_nodes:
+                item = item[subset]
+            elif torch.is_tensor(item) and item.size(0) == num_edges:
+                item = item[edge_mask]
+            kwargs[key] = item
+
+        return x, edge_index, mapping, edge_mask, kwargs
+
+    def __loss__(self, node_idx, log_logits, pred_label):
+        loss = -log_logits[node_idx, pred_label[node_idx]]
+
+        m = self.edge_mask.sigmoid()
+        loss = loss + self.coeffs['edge_size'] * m.sum()
+        ent = -m * torch.log(m + EPS) - (1 - m) * torch.log(1 - m + EPS)
+        loss = loss + self.coeffs['edge_ent'] * ent.mean()
+
+        m = self.node_feat_mask.sigmoid()
+        loss = loss + self.coeffs['node_feat_size'] * m.sum()
+        ent = -m * torch.log(m + EPS) - (1 - m) * torch.log(1 - m + EPS)
+        loss = loss + self.coeffs['node_feat_ent'] * ent.mean()
+
+        return loss
+
+    def explain_node(self, node_idx, x, edge_index, **kwargs):
+        r"""Learns and returns a node feature mask and an edge mask that play a
+        crucial role to explain the prediction made by the GNN for node
+        :attr:`node_idx`.
+
+        Args:
+            node_idx (int): The node to explain.
+            x (Tensor): The node feature matrix.
+            edge_index (LongTensor): The edge indices.
+            **kwargs (optional): Additional arguments passed to the GNN module.
+
+        :rtype: (:class:`Tensor`, :class:`Tensor`)
+        """
+
+        self.model.eval()
+        self.__clear_masks__()
+
+        num_edges = edge_index.size(1)
+
+        # Only operate on a k-hop subgraph around `node_idx`.
+        x, edge_index, mapping, hard_edge_mask, kwargs = self.__subgraph__(
+            node_idx, x, edge_index, **kwargs)
+
+        # Get the initial prediction.
+        with torch.no_grad():
+            log_logits = self.model(x=x, edge_index=edge_index, **kwargs)
+            pred_label = log_logits.argmax(dim=-1)
+
+        self.__set_masks__(x, edge_index)
+        self.to(x.device)
+
+        optimizer = torch.optim.Adam([self.node_feat_mask, self.edge_mask],
+                                     lr=self.lr)
+
+        if self.log:  # pragma: no cover
+            pbar = tqdm(total=self.epochs)
+            pbar.set_description(f'Explain node {node_idx}')
+
+        for epoch in range(1, self.epochs + 1):
+            optimizer.zero_grad()
+            h = x * self.node_feat_mask.view(1, -1).sigmoid()
+            log_logits = self.model(x=h, edge_index=edge_index, **kwargs)
+            loss = self.__loss__(mapping, log_logits, pred_label)
+            loss.backward()
+            optimizer.step()
+
+            if self.log:  # pragma: no cover
+                pbar.update(1)
+
+        if self.log:  # pragma: no cover
+            pbar.close()
+
+        node_feat_mask = self.node_feat_mask.detach().sigmoid()
+        edge_mask = self.edge_mask.new_zeros(num_edges)
+        edge_mask[hard_edge_mask] = self.edge_mask.detach().sigmoid()
+
+        self.__clear_masks__()
+
+        return node_feat_mask, edge_mask
+
+    def visualize_subgraph(self, node_idx, edge_index, edge_mask, y=None,
+                           threshold=None, **kwargs):
+        r"""Visualizes the subgraph around :attr:`node_idx` given an edge mask
+        :attr:`edge_mask`.
+
+        Args:
+            node_idx (int): The node id to explain.
+            edge_index (LongTensor): The edge indices.
+            edge_mask (Tensor): The edge mask.
+            y (Tensor, optional): The ground-truth node-prediction labels used
+                as node colorings. (default: :obj:`None`)
+            threshold (float, optional): Sets a threshold for visualizing
+                important edges. If set to :obj:`None`, will visualize all
+                edges with transparancy indicating the importance of edges.
+                (default: :obj:`None`)
+            **kwargs (optional): Additional arguments passed to
+                :func:`nx.draw`.
+
+        :rtype: :class:`matplotlib.axes.Axes`, :class:`networkx.DiGraph`
+        """
+
+        assert edge_mask.size(0) == edge_index.size(1)
+
+        # Only operate on a k-hop subgraph around `node_idx`.
+        subset, edge_index, _, hard_edge_mask = k_hop_subgraph(
+            node_idx, self.__num_hops__(), edge_index, relabel_nodes=True,
+            num_nodes=None, flow=self.__flow__())
+
+        edge_mask = edge_mask[hard_edge_mask]
+
+        if threshold is not None:
+            edge_mask = (edge_mask >= threshold).to(torch.float)
+
+        if y is None:
+            y = torch.zeros(edge_index.max().item() + 1,
+                            device=edge_index.device)
+        else:
+            y = y[subset].to(torch.float) / y.max().item()
+
+        data = Data(edge_index=edge_index, att=edge_mask, y=y,
+                    num_nodes=y.size(0)).to('cpu')
+        G = to_networkx(data, node_attrs=['y'], edge_attrs=['att'])
+        mapping = {k: i for k, i in enumerate(subset.tolist())}
+        G = nx.relabel_nodes(G, mapping)
+
+        kwargs['with_labels'] = kwargs.get('with_labels') or True
+        kwargs['font_size'] = kwargs.get('font_size') or 10
+        kwargs['node_size'] = kwargs.get('node_size') or 800
+        kwargs['cmap'] = kwargs.get('cmap') or 'cool'
+
+        pos = nx.spring_layout(G)
+        ax = plt.gca()
+        for source, target, data in G.edges(data=True):
+            ax.annotate(
+                '', xy=pos[target], xycoords='data', xytext=pos[source],
+                textcoords='data', arrowprops=dict(
+                    arrowstyle="->",
+                    alpha=max(data['att'], 0.1),
+                    shrinkA=sqrt(kwargs['node_size']) / 2.0,
+                    shrinkB=sqrt(kwargs['node_size']) / 2.0,
+                    connectionstyle="arc3,rad=0.1",
+                ))
+        nx.draw_networkx_nodes(G, pos, node_color=y.tolist(), **kwargs)
+        nx.draw_networkx_labels(G, pos, **kwargs)
+
+        return ax, G
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}()'
+import torch
+from sklearn.metrics import roc_auc_score, average_precision_score
+from torch_geometric.utils import (negative_sampling, remove_self_loops,
+                                   add_self_loops)
+
+from ..inits import reset
+
+EPS = 1e-15
+MAX_LOGVAR = 10
+
+
+class InnerProductDecoder(torch.nn.Module):
+    r"""The inner product decoder from the `"Variational Graph Auto-Encoders"
+    <https://arxiv.org/abs/1611.07308>`_ paper
+
+    .. math::
+        \sigma(\mathbf{Z}\mathbf{Z}^{\top})
+
+    where :math:`\mathbf{Z} \in \mathbb{R}^{N \times d}` denotes the latent
+    space produced by the encoder."""
+    def forward(self, z, edge_index, sigmoid=True):
+        r"""Decodes the latent variables :obj:`z` into edge probabilities for
+        the given node-pairs :obj:`edge_index`.
+
+        Args:
+            z (Tensor): The latent space :math:`\mathbf{Z}`.
+            sigmoid (bool, optional): If set to :obj:`False`, does not apply
+                the logistic sigmoid function to the output.
+                (default: :obj:`True`)
+        """
+        value = (z[edge_index[0]] * z[edge_index[1]]).sum(dim=1)
+        return torch.sigmoid(value) if sigmoid else value
+
+    def forward_all(self, z, sigmoid=True):
+        r"""Decodes the latent variables :obj:`z` into a probabilistic dense
+        adjacency matrix.
+
+        Args:
+            z (Tensor): The latent space :math:`\mathbf{Z}`.
+            sigmoid (bool, optional): If set to :obj:`False`, does not apply
+                the logistic sigmoid function to the output.
+                (default: :obj:`True`)
+        """
+        adj = torch.matmul(z, z.t())
+        return torch.sigmoid(adj) if sigmoid else adj
+
+
+class GAE(torch.nn.Module):
+    r"""The Graph Auto-Encoder model from the
+    `"Variational Graph Auto-Encoders" <https://arxiv.org/abs/1611.07308>`_
+    paper based on user-defined encoder and decoder models.
+
+    Args:
+        encoder (Module): The encoder module.
+        decoder (Module, optional): The decoder module. If set to :obj:`None`,
+            will default to the
+            :class:`torch_geometric.nn.models.InnerProductDecoder`.
+            (default: :obj:`None`)
+    """
+    def __init__(self, encoder, decoder=None):
+        super(GAE, self).__init__()
+        self.encoder = encoder
+        self.decoder = InnerProductDecoder() if decoder is None else decoder
+        GAE.reset_parameters(self)
+
+    def reset_parameters(self):
+        reset(self.encoder)
+        reset(self.decoder)
+
+    def encode(self, *args, **kwargs):
+        r"""Runs the encoder and computes node-wise latent variables."""
+        return self.encoder(*args, **kwargs)
+
+    def decode(self, *args, **kwargs):
+        r"""Runs the decoder and computes edge probabilities."""
+        return self.decoder(*args, **kwargs)
+
+    def recon_loss(self, z, pos_edge_index):
+        r"""Given latent variables :obj:`z`, computes the binary cross
+        entropy loss for positive edges :obj:`pos_edge_index` and negative
+        sampled edges.
+
+        Args:
+            z (Tensor): The latent space :math:`\mathbf{Z}`.
+            pos_edge_index (LongTensor): The positive edges to train against.
+        """
+
+        pos_loss = -torch.log(
+            self.decoder(z, pos_edge_index, sigmoid=True) + EPS).mean()
+
+        # Do not include self-loops in negative samples
+        pos_edge_index, _ = remove_self_loops(pos_edge_index)
+        pos_edge_index, _ = add_self_loops(pos_edge_index)
+
+        neg_edge_index = negative_sampling(pos_edge_index, z.size(0))
+        neg_loss = -torch.log(1 -
+                              self.decoder(z, neg_edge_index, sigmoid=True) +
+                              EPS).mean()
+
+        return pos_loss + neg_loss
+
+    def test(self, z, pos_edge_index, neg_edge_index):
+        r"""Given latent variables :obj:`z`, positive edges
+        :obj:`pos_edge_index` and negative edges :obj:`neg_edge_index`,
+        computes area under the ROC curve (AUC) and average precision (AP)
+        scores.
+
+        Args:
+            z (Tensor): The latent space :math:`\mathbf{Z}`.
+            pos_edge_index (LongTensor): The positive edges to evaluate
+                against.
+            neg_edge_index (LongTensor): The negative edges to evaluate
+                against.
+        """
+        pos_y = z.new_ones(pos_edge_index.size(1))
+        neg_y = z.new_zeros(neg_edge_index.size(1))
+        y = torch.cat([pos_y, neg_y], dim=0)
+
+        pos_pred = self.decoder(z, pos_edge_index, sigmoid=True)
+        neg_pred = self.decoder(z, neg_edge_index, sigmoid=True)
+        pred = torch.cat([pos_pred, neg_pred], dim=0)
+
+        y, pred = y.detach().cpu().numpy(), pred.detach().cpu().numpy()
+
+        return roc_auc_score(y, pred), average_precision_score(y, pred)
+
+
+class VGAE(GAE):
+    r"""The Variational Graph Auto-Encoder model from the
+    `"Variational Graph Auto-Encoders" <https://arxiv.org/abs/1611.07308>`_
+    paper.
+
+    Args:
+        encoder (Module): The encoder module to compute :math:`\mu` and
+            :math:`\log\sigma^2`.
+        decoder (Module, optional): The decoder module. If set to :obj:`None`,
+            will default to the
+            :class:`torch_geometric.nn.models.InnerProductDecoder`.
+            (default: :obj:`None`)
+    """
+    def __init__(self, encoder, decoder=None):
+        super(VGAE, self).__init__(encoder, decoder)
+
+    def reparametrize(self, mu, logvar):
+        if self.training:
+            return mu + torch.randn_like(logvar) * torch.exp(logvar)
+        else:
+            return mu
+
+    def encode(self, *args, **kwargs):
+        """"""
+        self.__mu__, self.__logvar__ = self.encoder(*args, **kwargs)
+        self.__logvar__ = self.__logvar__.clamp(max=MAX_LOGVAR)
+        z = self.reparametrize(self.__mu__, self.__logvar__)
+        return z
+
+    def kl_loss(self, mu=None, logvar=None):
+        r"""Computes the KL loss, either for the passed arguments :obj:`mu`
+        and :obj:`logvar`, or based on latent variables from last encoding.
+
+        Args:
+            mu (Tensor, optional): The latent space for :math:`\mu`. If set to
+                :obj:`None`, uses the last computation of :math:`mu`.
+                (default: :obj:`None`)
+            logvar (Tensor, optional): The latent space for
+                :math:`\log\sigma^2`.  If set to :obj:`None`, uses the last
+                computation of :math:`\log\sigma^2`.(default: :obj:`None`)
+        """
+        mu = self.__mu__ if mu is None else mu
+        logvar = self.__logvar__ if logvar is None else logvar.clamp(
+            max=MAX_LOGVAR)
+        return -0.5 * torch.mean(
+            torch.sum(1 + logvar - mu**2 - logvar.exp(), dim=1))
+
+
+class ARGA(GAE):
+    r"""The Adversarially Regularized Graph Auto-Encoder model from the
+    `"Adversarially Regularized Graph Autoencoder for Graph Embedding"
+    <https://arxiv.org/abs/1802.04407>`_ paper.
+    paper.
+
+    Args:
+        encoder (Module): The encoder module.
+        discriminator (Module): The discriminator module.
+        decoder (Module, optional): The decoder module. If set to :obj:`None`,
+            will default to the
+            :class:`torch_geometric.nn.models.InnerProductDecoder`.
+            (default: :obj:`None`)
+    """
+    def __init__(self, encoder, discriminator, decoder=None):
+        super(ARGA, self).__init__(encoder, decoder)
+        self.discriminator = discriminator
+        reset(self.discriminator)
+
+    def reset_parameters(self):
+        super(ARGA, self).reset_parameters()
+        reset(self.discriminator)
+
+    def reg_loss(self, z):
+        r"""Computes the regularization loss of the encoder.
+
+        Args:
+            z (Tensor): The latent space :math:`\mathbf{Z}`.
+        """
+        real = torch.sigmoid(self.discriminator(z))
+        real_loss = -torch.log(real + EPS).mean()
+        return real_loss
+
+    def discriminator_loss(self, z):
+        r"""Computes the loss of the discriminator.
+
+        Args:
+            z (Tensor): The latent space :math:`\mathbf{Z}`.
+        """
+        real = torch.sigmoid(self.discriminator(torch.randn_like(z)))
+        fake = torch.sigmoid(self.discriminator(z.detach()))
+        real_loss = -torch.log(real + EPS).mean()
+        fake_loss = -torch.log(1 - fake + EPS).mean()
+        return real_loss + fake_loss
+
+
+class ARGVA(ARGA):
+    r"""The Adversarially Regularized Variational Graph Auto-Encoder model from
+    the `"Adversarially Regularized Graph Autoencoder for Graph Embedding"
+    <https://arxiv.org/abs/1802.04407>`_ paper.
+    paper.
+
+    Args:
+        encoder (Module): The encoder module to compute :math:`\mu` and
+            :math:`\log\sigma^2`.
+        discriminator (Module): The discriminator module.
+        decoder (Module, optional): The decoder module. If set to :obj:`None`,
+            will default to the
+            :class:`torch_geometric.nn.models.InnerProductDecoder`.
+            (default: :obj:`None`)
+    """
+    def __init__(self, encoder, discriminator, decoder=None):
+        super(ARGVA, self).__init__(encoder, discriminator, decoder)
+        self.VGAE = VGAE(encoder, decoder)
+
+    @property
+    def __mu__(self):
+        return self.VGAE.__mu__
+
+    @property
+    def __logvar__(self):
+        return self.VGAE.__logvar__
+
+    def reparametrize(self, mu, logvar):
+        return self.VGAE.reparametrize(mu, logvar)
+
+    def encode(self, *args, **kwargs):
+        """"""
+        return self.VGAE.encode(*args, **kwargs)
+
+    def kl_loss(self, mu=None, logvar=None):
+        return self.VGAE.kl_loss(mu, logvar)
+# Shameless steal from: https://github.com/klicperajo/dimenet
+
+import numpy as np
+from scipy.optimize import brentq
+from scipy import special as sp
+
+try:
+    import sympy as sym
+except ImportError:
+    sym = None
+
+
+def Jn(r, n):
+    return np.sqrt(np.pi / (2 * r)) * sp.jv(n + 0.5, r)
+
+
+def Jn_zeros(n, k):
+    zerosj = np.zeros((n, k), dtype='float32')
+    zerosj[0] = np.arange(1, k + 1) * np.pi
+    points = np.arange(1, k + n) * np.pi
+    racines = np.zeros(k + n - 1, dtype='float32')
+    for i in range(1, n):
+        for j in range(k + n - 1 - i):
+            foo = brentq(Jn, points[j], points[j + 1], (i, ))
+            racines[j] = foo
+        points = racines
+        zerosj[i][:k] = racines[:k]
+
+    return zerosj
+
+
+def spherical_bessel_formulas(n):
+    x = sym.symbols('x')
+
+    f = [sym.sin(x) / x]
+    a = sym.sin(x) / x
+    for i in range(1, n):
+        b = sym.diff(a, x) / x
+        f += [sym.simplify(b * (-x)**i)]
+        a = sym.simplify(b)
+    return f
+
+
+def bessel_basis(n, k):
+    zeros = Jn_zeros(n, k)
+    normalizer = []
+    for order in range(n):
+        normalizer_tmp = []
+        for i in range(k):
+            normalizer_tmp += [0.5 * Jn(zeros[order, i], order + 1)**2]
+        normalizer_tmp = 1 / np.array(normalizer_tmp)**0.5
+        normalizer += [normalizer_tmp]
+
+    f = spherical_bessel_formulas(n)
+    x = sym.symbols('x')
+    bess_basis = []
+    for order in range(n):
+        bess_basis_tmp = []
+        for i in range(k):
+            bess_basis_tmp += [
+                sym.simplify(normalizer[order][i] *
+                             f[order].subs(x, zeros[order, i] * x))
+            ]
+        bess_basis += [bess_basis_tmp]
+    return bess_basis
+
+
+def sph_harm_prefactor(k, m):
+    return ((2 * k + 1) * np.math.factorial(k - abs(m)) /
+            (4 * np.pi * np.math.factorial(k + abs(m))))**0.5
+
+
+def associated_legendre_polynomials(k, zero_m_only=True):
+    z = sym.symbols('z')
+    P_l_m = [[0] * (j + 1) for j in range(k)]
+
+    P_l_m[0][0] = 1
+    if k > 0:
+        P_l_m[1][0] = z
+
+        for j in range(2, k):
+            P_l_m[j][0] = sym.simplify(((2 * j - 1) * z * P_l_m[j - 1][0] -
+                                        (j - 1) * P_l_m[j - 2][0]) / j)
+        if not zero_m_only:
+            for i in range(1, k):
+                P_l_m[i][i] = sym.simplify((1 - 2 * i) * P_l_m[i - 1][i - 1])
+                if i + 1 < k:
+                    P_l_m[i + 1][i] = sym.simplify(
+                        (2 * i + 1) * z * P_l_m[i][i])
+                for j in range(i + 2, k):
+                    P_l_m[j][i] = sym.simplify(
+                        ((2 * j - 1) * z * P_l_m[j - 1][i] -
+                         (i + j - 1) * P_l_m[j - 2][i]) / (j - i))
+
+    return P_l_m
+
+
+def real_sph_harm(k, zero_m_only=True, spherical_coordinates=True):
+    if not zero_m_only:
+        S_m = [0]
+        C_m = [1]
+        for i in range(1, k):
+            x = sym.symbols('x')
+            y = sym.symbols('y')
+            S_m += [x * S_m[i - 1] + y * C_m[i - 1]]
+            C_m += [x * C_m[i - 1] - y * S_m[i - 1]]
+
+    P_l_m = associated_legendre_polynomials(k, zero_m_only)
+    if spherical_coordinates:
+        theta = sym.symbols('theta')
+        z = sym.symbols('z')
+        for i in range(len(P_l_m)):
+            for j in range(len(P_l_m[i])):
+                if type(P_l_m[i][j]) != int:
+                    P_l_m[i][j] = P_l_m[i][j].subs(z, sym.cos(theta))
+        if not zero_m_only:
+            phi = sym.symbols('phi')
+            for i in range(len(S_m)):
+                S_m[i] = S_m[i].subs(x,
+                                     sym.sin(theta) * sym.cos(phi)).subs(
+                                         y,
+                                         sym.sin(theta) * sym.sin(phi))
+            for i in range(len(C_m)):
+                C_m[i] = C_m[i].subs(x,
+                                     sym.sin(theta) * sym.cos(phi)).subs(
+                                         y,
+                                         sym.sin(theta) * sym.sin(phi))
+
+    Y_func_l_m = [['0'] * (2 * j + 1) for j in range(k)]
+    for i in range(k):
+        Y_func_l_m[i][0] = sym.simplify(sph_harm_prefactor(i, 0) * P_l_m[i][0])
+
+    if not zero_m_only:
+        for i in range(1, k):
+            for j in range(1, i + 1):
+                Y_func_l_m[i][j] = sym.simplify(
+                    2**0.5 * sph_harm_prefactor(i, j) * C_m[j] * P_l_m[i][j])
+        for i in range(1, k):
+            for j in range(1, i + 1):
+                Y_func_l_m[i][-j] = sym.simplify(
+                    2**0.5 * sph_harm_prefactor(i, -j) * S_m[j] * P_l_m[i][j])
+
+    return Y_func_l_m
+import math
+
+import torch
+from torch.nn import Parameter, GRU, Linear
+import torch.nn.functional as F
+from torch_scatter import scatter_mean
+
+
+class RENet(torch.nn.Module):
+    r"""The Recurrent Event Network model from the `"Recurrent Event Network
+    for Reasoning over Temporal Knowledge Graphs"
+    <https://arxiv.org/abs/1904.05530>`_ paper
+
+    .. math::
+        f_{\mathbf{\Theta}}(\mathbf{e}_s, \mathbf{e}_r,
+        \mathbf{h}^{(t-1)}(s, r))
+
+    based on a RNN encoder
+
+    .. math::
+        \mathbf{h}^{(t)}(s, r) = \textrm{RNN}(\mathbf{e}_s, \mathbf{e}_r,
+        g(\mathcal{O}^{(t)}_r(s)), \mathbf{h}^{(t-1)}(s, r))
+
+    where :math:`\mathbf{e}_s` and :math:`\mathbf{e}_r` denote entity and
+    relation embeddings, and :math:`\mathcal{O}^{(t)}_r(s)` represents the set
+    of objects interacted with subject :math:`s` under relation :math:`r` at
+    timestamp :math:`t`.
+    This model implements :math:`g` as the **Mean Aggregator** and
+    :math:`f_{\mathbf{\Theta}}` as a linear projection.
+
+    Args:
+        num_nodes (int): The number of nodes in the knowledge graph.
+        num_rels (int): The number of relations in the knowledge graph.
+        hidden_channels (int): Hidden size of node and relation embeddings.
+        seq_len (int): The sequence length of past events.
+        num_layers (int, optional): The number of recurrent layers.
+            (default: :obj:`1`)
+        dropout (float): If non-zero, introduces a dropout layer before the
+            final prediction. (default: :obj:`0.`)
+        bias (bool, optional): If set to :obj:`False`, all layers will not
+            learn an additive bias. (default: :obj:`True`)
+    """
+
+    def __init__(self, num_nodes, num_rels, hidden_channels, seq_len,
+                 num_layers=1, dropout=0., bias=True):
+        super(RENet, self).__init__()
+
+        self.num_nodes = num_nodes
+        self.hidden_channels = hidden_channels
+        self.num_rels = num_rels
+        self.seq_len = seq_len
+        self.dropout = dropout
+
+        self.ent = Parameter(torch.Tensor(num_nodes, hidden_channels))
+        self.rel = Parameter(torch.Tensor(num_rels, hidden_channels))
+
+        self.sub_gru = GRU(3 * hidden_channels, hidden_channels, num_layers,
+                           batch_first=True, bias=bias)
+        self.obj_gru = GRU(3 * hidden_channels, hidden_channels, num_layers,
+                           batch_first=True, bias=bias)
+
+        self.sub_lin = Linear(3 * hidden_channels, num_nodes, bias=bias)
+        self.obj_lin = Linear(3 * hidden_channels, num_nodes, bias=bias)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.xavier_uniform_(self.ent, gain=math.sqrt(2.0))
+        torch.nn.init.xavier_uniform_(self.rel, gain=math.sqrt(2.0))
+
+        self.sub_gru.reset_parameters()
+        self.obj_gru.reset_parameters()
+        self.sub_lin.reset_parameters()
+        self.obj_lin.reset_parameters()
+
+    @staticmethod
+    def pre_transform(seq_len):
+        r"""Precomputes history objects
+
+        .. math::
+            \{ \mathcal{O}^{(t-k-1)}_r(s), \ldots, \mathcal{O}^{(t-1)}_r(s) \}
+
+        of a :class:`torch_geometric.datasets.icews.EventDataset` with
+        :math:`k` denoting the sequence length :obj:`seq_len`.
+        """
+
+        class PreTransform(object):
+            def __init__(self, seq_len):
+                self.seq_len = seq_len
+                self.inc = 5000
+                self.t_last = 0
+                self.sub_hist = self.increase_hist_node_size([])
+                self.obj_hist = self.increase_hist_node_size([])
+
+            def increase_hist_node_size(self, hist):
+                hist_inc = torch.zeros((self.inc, self.seq_len + 1, 0))
+                return hist + hist_inc.tolist()
+
+            def get_history(self, hist, node, rel):
+                hists, ts = [], []
+                for s in range(seq_len):
+                    h = hist[node][s]
+                    hists += h
+                    ts.append(torch.full((len(h), ), s, dtype=torch.long))
+                node, r = torch.tensor(hists, dtype=torch.long).view(
+                    -1, 2).t().contiguous()
+                node = node[r == rel]
+                t = torch.cat(ts, dim=0)[r == rel]
+                return node, t
+
+            def step(self, hist):
+                for i in range(len(hist)):
+                    hist[i] = hist[i][1:]
+                    hist[i].append([])
+                return hist
+
+            def __call__(self, data):
+                sub, rel, obj, t = data.sub, data.rel, data.obj, data.t
+
+                if max(sub, obj) + 1 > len(self.sub_hist):  # pragma: no cover
+                    self.sub_hist = self.increase_hist_node_size(self.sub_hist)
+                    self.obj_hist = self.increase_hist_node_size(self.obj_hist)
+
+                # Delete last timestamp in history.
+                if t > self.t_last:
+                    self.sub_hist = self.step(self.sub_hist)
+                    self.obj_hist = self.step(self.obj_hist)
+                    self.t_last = t
+
+                # Save history in data object.
+                data.h_sub, data.h_sub_t = self.get_history(
+                    self.sub_hist, sub, rel)
+                data.h_obj, data.h_obj_t = self.get_history(
+                    self.obj_hist, obj, rel)
+
+                # Add new event to history.
+                self.sub_hist[sub][-1].append([obj, rel])
+                self.obj_hist[obj][-1].append([sub, rel])
+
+                return data
+
+            def __repr__(self):  # pragma: no cover
+                return '{}(seq_len={})'.format(self.__class__.__name__,
+                                               self.seq_len)
+
+        return PreTransform(seq_len)
+
+    def forward(self, data):
+        """Given a :obj:`data` batch, computes the forward pass.
+
+        Args:
+            data (torch_geometric.data.Data): The input data, holding subject
+                :obj:`sub`, relation :obj:`rel` and object :obj:`obj`
+                information with shape :obj:`[batch_size]`.
+                In addition, :obj:`data` needs to hold history information for
+                subjects, given by a vector of node indices :obj:`h_sub` and
+                their relative timestamps :obj:`h_sub_t` and batch assignments
+                :obj:`h_sub_batch`.
+                The same information must be given for objects (:obj:`h_obj`,
+                :obj:`h_obj_t`, :obj:`h_obj_batch`).
+        """
+
+        assert 'h_sub_batch' in data and 'h_obj_batch' in data
+        batch_size, seq_len = data.sub.size(0), self.seq_len
+
+        h_sub_t = data.h_sub_t + data.h_sub_batch * seq_len
+        h_obj_t = data.h_obj_t + data.h_obj_batch * seq_len
+
+        h_sub = scatter_mean(self.ent[data.h_sub], h_sub_t, dim=0,
+                             dim_size=batch_size * seq_len).view(
+                                 batch_size, seq_len, -1)
+        h_obj = scatter_mean(self.ent[data.h_obj], h_obj_t, dim=0,
+                             dim_size=batch_size * seq_len).view(
+                                 batch_size, seq_len, -1)
+
+        sub = self.ent[data.sub].unsqueeze(1).repeat(1, seq_len, 1)
+        rel = self.rel[data.rel].unsqueeze(1).repeat(1, seq_len, 1)
+        obj = self.ent[data.obj].unsqueeze(1).repeat(1, seq_len, 1)
+
+        _, h_sub = self.sub_gru(torch.cat([sub, h_sub, rel], dim=-1))
+        _, h_obj = self.obj_gru(torch.cat([obj, h_obj, rel], dim=-1))
+        h_sub, h_obj = h_sub.squeeze(0), h_obj.squeeze(0)
+
+        h_sub = torch.cat([self.ent[data.sub], h_sub, self.rel[data.rel]],
+                          dim=-1)
+        h_obj = torch.cat([self.ent[data.obj], h_obj, self.rel[data.rel]],
+                          dim=-1)
+
+        h_sub = F.dropout(h_sub, p=self.dropout, training=self.training)
+        h_obj = F.dropout(h_obj, p=self.dropout, training=self.training)
+
+        log_prob_obj = F.log_softmax(self.sub_lin(h_sub), dim=1)
+        log_prob_sub = F.log_softmax(self.obj_lin(h_obj), dim=1)
+
+        return log_prob_obj, log_prob_sub
+
+    def test(self, logits, y):
+        """Given ground-truth :obj:`y`, computes Mean Reciprocal Rank (MRR)
+        and Hits at 1/3/10."""
+
+        _, perm = logits.sort(dim=1, descending=True)
+        mask = (y.view(-1, 1) == perm)
+
+        mrr = (1 / (mask.nonzero()[:, -1] + 1).to(torch.float)).mean().item()
+        hits1 = mask[:, :1].sum().item() / y.size(0)
+        hits3 = mask[:, :3].sum().item() / y.size(0)
+        hits10 = mask[:, :10].sum().item() / y.size(0)
+
+        return torch.tensor([mrr, hits1, hits3, hits10])
+import torch
+import torch.nn.functional as F
+from torch_sparse import spspmm
+from torch_geometric.nn import TopKPooling, GCNConv
+from torch_geometric.utils import (add_self_loops, sort_edge_index,
+                                   remove_self_loops)
+from torch_geometric.utils.repeat import repeat
+
+
+class GraphUNet(torch.nn.Module):
+    r"""The Graph U-Net model from the `"Graph U-Nets"
+    <https://arxiv.org/abs/1905.05178>`_ paper which implements a U-Net like
+    architecture with graph pooling and unpooling operations.
+
+    Args:
+        in_channels (int): Size of each input sample.
+        hidden_channels (int): Size of each hidden sample.
+        out_channels (int): Size of each output sample.
+        depth (int): The depth of the U-Net architecture.
+        pool_ratios (float or [float], optional): Graph pooling ratio for each
+            depth. (default: :obj:`0.5`)
+        sum_res (bool, optional): If set to :obj:`False`, will use
+            concatenation for integration of skip connections instead
+            summation. (default: :obj:`True`)
+        act (torch.nn.functional, optional): The nonlinearity to use.
+            (default: :obj:`torch.nn.functional.relu`)
+    """
+
+    def __init__(self, in_channels, hidden_channels, out_channels, depth,
+                 pool_ratios=0.5, sum_res=True, act=F.relu):
+        super(GraphUNet, self).__init__()
+        assert depth >= 1
+        self.in_channels = in_channels
+        self.hidden_channels = hidden_channels
+        self.out_channels = out_channels
+        self.depth = depth
+        self.pool_ratios = repeat(pool_ratios, depth)
+        self.act = act
+        self.sum_res = sum_res
+
+        channels = hidden_channels
+
+        self.down_convs = torch.nn.ModuleList()
+        self.pools = torch.nn.ModuleList()
+        self.down_convs.append(GCNConv(in_channels, channels, improved=True))
+        for i in range(depth):
+            self.pools.append(TopKPooling(channels, self.pool_ratios[i]))
+            self.down_convs.append(GCNConv(channels, channels, improved=True))
+
+        in_channels = channels if sum_res else 2 * channels
+
+        self.up_convs = torch.nn.ModuleList()
+        for i in range(depth - 1):
+            self.up_convs.append(GCNConv(in_channels, channels, improved=True))
+        self.up_convs.append(GCNConv(in_channels, out_channels, improved=True))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for conv in self.down_convs:
+            conv.reset_parameters()
+        for pool in self.pools:
+            pool.reset_parameters()
+        for conv in self.up_convs:
+            conv.reset_parameters()
+
+    def forward(self, x, edge_index, batch=None):
+        """"""
+        if batch is None:
+            batch = edge_index.new_zeros(x.size(0))
+        edge_weight = x.new_ones(edge_index.size(1))
+
+        x = self.down_convs[0](x, edge_index, edge_weight)
+        x = self.act(x)
+
+        xs = [x]
+        edge_indices = [edge_index]
+        edge_weights = [edge_weight]
+        perms = []
+
+        for i in range(1, self.depth + 1):
+            edge_index, edge_weight = self.augment_adj(edge_index, edge_weight,
+                                                       x.size(0))
+            x, edge_index, edge_weight, batch, perm, _ = self.pools[i - 1](
+                x, edge_index, edge_weight, batch)
+
+            x = self.down_convs[i](x, edge_index, edge_weight)
+            x = self.act(x)
+
+            if i < self.depth:
+                xs += [x]
+                edge_indices += [edge_index]
+                edge_weights += [edge_weight]
+            perms += [perm]
+
+        for i in range(self.depth):
+            j = self.depth - 1 - i
+
+            res = xs[j]
+            edge_index = edge_indices[j]
+            edge_weight = edge_weights[j]
+            perm = perms[j]
+
+            up = torch.zeros_like(res)
+            up[perm] = x
+            x = res + up if self.sum_res else torch.cat((res, up), dim=-1)
+
+            x = self.up_convs[i](x, edge_index, edge_weight)
+            x = self.act(x) if i < self.depth - 1 else x
+
+        return x
+
+    def augment_adj(self, edge_index, edge_weight, num_nodes):
+        edge_index, edge_weight = add_self_loops(edge_index, edge_weight,
+                                                 num_nodes=num_nodes)
+        edge_index, edge_weight = sort_edge_index(edge_index, edge_weight,
+                                                  num_nodes)
+        edge_index, edge_weight = spspmm(edge_index, edge_weight, edge_index,
+                                         edge_weight, num_nodes, num_nodes,
+                                         num_nodes)
+        edge_index, edge_weight = remove_self_loops(edge_index, edge_weight)
+        return edge_index, edge_weight
+
+    def __repr__(self):
+        return '{}({}, {}, {}, depth={}, pool_ratios={})'.format(
+            self.__class__.__name__, self.in_channels, self.hidden_channels,
+            self.out_channels, self.depth, self.pool_ratios)
+import torch
+from torch.nn import Linear, LSTM
+
+
+class JumpingKnowledge(torch.nn.Module):
+    r"""The Jumping Knowledge layer aggregation module from the
+    `"Representation Learning on Graphs with Jumping Knowledge Networks"
+    <https://arxiv.org/abs/1806.03536>`_ paper based on either
+    **concatenation** (:obj:`"cat"`)
+
+    .. math::
+
+        \mathbf{x}_v^{(1)} \, \Vert \, \ldots \, \Vert \, \mathbf{x}_v^{(T)}
+
+    **max pooling** (:obj:`"max"`)
+
+    .. math::
+
+        \max \left( \mathbf{x}_v^{(1)}, \ldots, \mathbf{x}_v^{(T)} \right)
+
+    or **weighted summation**
+
+    .. math::
+
+        \sum_{t=1}^T \alpha_v^{(t)} \mathbf{x}_v^{(t)}
+
+    with attention scores :math:`\alpha_v^{(t)}` obtained from a bi-directional
+    LSTM (:obj:`"lstm"`).
+
+    Args:
+        mode (string): The aggregation scheme to use
+            (:obj:`"cat"`, :obj:`"max"` or :obj:`"lstm"`).
+        channels (int, optional): The number of channels per representation.
+            Needs to be only set for LSTM-style aggregation.
+            (default: :obj:`None`)
+        num_layers (int, optional): The number of layers to aggregate. Needs to
+            be only set for LSTM-style aggregation. (default: :obj:`None`)
+    """
+
+    def __init__(self, mode, channels=None, num_layers=None):
+        super(JumpingKnowledge, self).__init__()
+        self.mode = mode.lower()
+        assert self.mode in ['cat', 'max', 'lstm']
+
+        if mode == 'lstm':
+            assert channels is not None, 'channels cannot be None for lstm'
+            assert num_layers is not None, 'num_layers cannot be None for lstm'
+            self.lstm = LSTM(
+                channels, (num_layers * channels) // 2,
+                bidirectional=True,
+                batch_first=True)
+            self.att = Linear(2 * ((num_layers * channels) // 2), 1)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        if hasattr(self, 'lstm'):
+            self.lstm.reset_parameters()
+        if hasattr(self, 'att'):
+            self.att.reset_parameters()
+
+    def forward(self, xs):
+        r"""Aggregates representations across different layers.
+
+        Args:
+            xs (list or tuple): List containing layer-wise representations.
+        """
+
+        assert isinstance(xs, list) or isinstance(xs, tuple)
+
+        if self.mode == 'cat':
+            return torch.cat(xs, dim=-1)
+        elif self.mode == 'max':
+            return torch.stack(xs, dim=-1).max(dim=-1)[0]
+        elif self.mode == 'lstm':
+            x = torch.stack(xs, dim=1)  # [num_nodes, num_layers, num_channels]
+            alpha, _ = self.lstm(x)
+            alpha = self.att(alpha).squeeze(-1)  # [num_nodes, num_layers]
+            alpha = torch.softmax(alpha, dim=-1)
+            return (x * alpha.unsqueeze(-1)).sum(dim=1)
+
+    def __repr__(self):
+        return '{}({})'.format(self.__class__.__name__, self.mode)
+import torch
+from torch.nn import Embedding
+from torch.utils.data import DataLoader
+from torch_sparse import SparseTensor
+from sklearn.linear_model import LogisticRegression
+
+EPS = 1e-15
+
+
+class MetaPath2Vec(torch.nn.Module):
+    r"""The MetaPath2Vec model from the `"metapath2vec: Scalable Representation
+    Learning for Heterogeneous Networks"
+    <https://ericdongyx.github.io/papers/
+    KDD17-dong-chawla-swami-metapath2vec.pdf>`_ paper where random walks based
+    on a given :obj:`metapath` are sampled in a heterogeneous graph, and node
+    embeddings are learned via negative sampling optimization.
+
+    .. note::
+
+        For an example of using MetaPath2Vec, see `examples/metapath2vec.py
+        <https://github.com/rusty1s/pytorch_geometric/blob/master/examples/
+        metapath2vec.py>`_.
+
+    Args:
+        edge_index_dict (dict): Dictionary holding edge indices for each
+            :obj:`(source_node_type, relation_type, target_node_type)` present
+            in the heterogeneous graph.
+        embedding_dim (int): The size of each embedding vector.
+        metapath (list): The metapath described as a list of
+            :obj:`(source_node_type, relation_type, target_node_type)` tuples.
+        walk_length (int): The walk length.
+        context_size (int): The actual context size which is considered for
+            positive samples. This parameter increases the effective sampling
+            rate by reusing samples across different source nodes.
+        walks_per_node (int, optional): The number of walks to sample for each
+            node. (default: :obj:`1`)
+        num_negative_samples (int, optional): The number of negative samples to
+            use for each positive sample. (default: :obj:`1`)
+        num_nodes_dict (dict, optional): Dictionary holding the number of nodes
+            for each node type. (default: :obj:`None`)
+        sparse (bool, optional): If set to :obj:`True`, gradients w.r.t. to the
+            weight matrix will be sparse. (default: :obj:`False`)
+    """
+    def __init__(self, edge_index_dict, embedding_dim, metapath, walk_length,
+                 context_size, walks_per_node=1, num_negative_samples=1,
+                 num_nodes_dict=None, sparse=False):
+        super(MetaPath2Vec, self).__init__()
+
+        if num_nodes_dict is None:
+            num_nodes_dict = {}
+            for keys, edge_index in edge_index_dict.items():
+                key = keys[0]
+                N = int(edge_index[0].max() + 1)
+                num_nodes_dict[key] = max(N, num_nodes_dict.get(key, N))
+
+                key = keys[-1]
+                N = int(edge_index[1].max() + 1)
+                num_nodes_dict[key] = max(N, num_nodes_dict.get(key, N))
+
+        adj_dict = {}
+        for keys, edge_index in edge_index_dict.items():
+            sizes = (num_nodes_dict[keys[0]], num_nodes_dict[keys[-1]])
+            row, col = edge_index
+            adj = SparseTensor(row=row, col=col, sparse_sizes=sizes)
+            adj = adj.to('cpu')
+            adj_dict[keys] = adj
+
+        assert metapath[0][0] == metapath[-1][-1]
+        assert walk_length >= context_size
+
+        self.adj_dict = adj_dict
+        self.embedding_dim = embedding_dim
+        self.metapath = metapath
+        self.walk_length = walk_length
+        self.context_size = context_size
+        self.walks_per_node = walks_per_node
+        self.num_negative_samples = num_negative_samples
+        self.num_nodes_dict = num_nodes_dict
+
+        types = set([x[0] for x in metapath]) | set([x[-1] for x in metapath])
+        types = sorted(list(types))
+
+        count = 0
+        self.start, self.end = {}, {}
+        for key in types:
+            self.start[key] = count
+            count += num_nodes_dict[key]
+            self.end[key] = count
+
+        offset = [self.start[metapath[0][0]]]
+        offset += [self.start[keys[-1]] for keys in metapath
+                   ] * int((walk_length / len(metapath)) + 1)
+        offset = offset[:walk_length + 1]
+        assert len(offset) == walk_length + 1
+        self.offset = torch.tensor(offset)
+
+        self.embedding = Embedding(count, embedding_dim, sparse=sparse)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.embedding.reset_parameters()
+
+    def forward(self, node_type, batch=None):
+        """Returns the embeddings for the nodes in :obj:`subset` of type
+        :obj:`node_type`."""
+        emb = self.embedding.weight[self.start[node_type]:self.end[node_type]]
+        return emb if batch is None else emb[batch]
+
+    def loader(self, **kwargs):
+        return DataLoader(range(self.num_nodes_dict[self.metapath[0][0]]),
+                          collate_fn=self.sample, **kwargs)
+
+    def pos_sample(self, batch):
+        # device = self.embedding.weight.device
+
+        batch = batch.repeat(self.walks_per_node)
+
+        rws = [batch]
+        for i in range(self.walk_length):
+            keys = self.metapath[i % len(self.metapath)]
+            adj = self.adj_dict[keys]
+            batch = adj.sample(num_neighbors=1, subset=batch).squeeze()
+            rws.append(batch)
+
+        rw = torch.stack(rws, dim=-1)
+        rw.add_(self.offset.view(1, -1))
+
+        walks = []
+        num_walks_per_rw = 1 + self.walk_length + 1 - self.context_size
+        for j in range(num_walks_per_rw):
+            walks.append(rw[:, j:j + self.context_size])
+        return torch.cat(walks, dim=0)
+
+    def neg_sample(self, batch):
+        batch = batch.repeat(self.walks_per_node * self.num_negative_samples)
+
+        rws = [batch]
+        for i in range(self.walk_length):
+            keys = self.metapath[i % len(self.metapath)]
+            batch = torch.randint(0, self.num_nodes_dict[keys[-1]],
+                                  (batch.size(0), ), dtype=torch.long)
+            rws.append(batch)
+
+        rw = torch.stack(rws, dim=-1)
+        rw.add_(self.offset.view(1, -1))
+
+        walks = []
+        num_walks_per_rw = 1 + self.walk_length + 1 - self.context_size
+        for j in range(num_walks_per_rw):
+            walks.append(rw[:, j:j + self.context_size])
+        return torch.cat(walks, dim=0)
+
+    def sample(self, batch):
+        if not isinstance(batch, torch.Tensor):
+            batch = torch.tensor(batch)
+        return self.pos_sample(batch), self.neg_sample(batch)
+
+    def loss(self, pos_rw, neg_rw):
+        r"""Computes the loss given positive and negative random walks."""
+
+        # Positive loss.
+        start, rest = pos_rw[:, 0], pos_rw[:, 1:].contiguous()
+
+        h_start = self.embedding(start).view(pos_rw.size(0), 1,
+                                             self.embedding_dim)
+        h_rest = self.embedding(rest.view(-1)).view(pos_rw.size(0), -1,
+                                                    self.embedding_dim)
+
+        out = (h_start * h_rest).sum(dim=-1).view(-1)
+        pos_loss = -torch.log(torch.sigmoid(out) + EPS).mean()
+
+        # Negative loss.
+        start, rest = neg_rw[:, 0], neg_rw[:, 1:].contiguous()
+
+        h_start = self.embedding(start).view(neg_rw.size(0), 1,
+                                             self.embedding_dim)
+        h_rest = self.embedding(rest.view(-1)).view(neg_rw.size(0), -1,
+                                                    self.embedding_dim)
+
+        out = (h_start * h_rest).sum(dim=-1).view(-1)
+        neg_loss = -torch.log(1 - torch.sigmoid(out) + EPS).mean()
+
+        return pos_loss + neg_loss
+
+    def test(self, train_z, train_y, test_z, test_y, solver='lbfgs',
+             multi_class='auto', *args, **kwargs):
+        r"""Evaluates latent space quality via a logistic regression downstream
+        task."""
+        clf = LogisticRegression(solver=solver, multi_class=multi_class, *args,
+                                 **kwargs).fit(train_z.detach().cpu().numpy(),
+                                               train_y.detach().cpu().numpy())
+        return clf.score(test_z.detach().cpu().numpy(),
+                         test_y.detach().cpu().numpy())
+
+    def __repr__(self):
+        return '{}({}, {})'.format(self.__class__.__name__,
+                                   self.embedding.weight.size(0),
+                                   self.embedding.weight.size(1))
+from .jumping_knowledge import JumpingKnowledge
+from .node2vec import Node2Vec
+from .deep_graph_infomax import DeepGraphInfomax
+from .autoencoder import InnerProductDecoder, GAE, VGAE, ARGA, ARGVA
+from .signed_gcn import SignedGCN
+from .re_net import RENet
+from .graph_unet import GraphUNet
+from .schnet import SchNet
+from .dimenet import DimeNet
+from .gnn_explainer import GNNExplainer
+from .metapath2vec import MetaPath2Vec
+
+__all__ = [
+    'JumpingKnowledge',
+    'Node2Vec',
+    'DeepGraphInfomax',
+    'InnerProductDecoder',
+    'GAE',
+    'VGAE',
+    'ARGA',
+    'ARGVA',
+    'SignedGCN',
+    'RENet',
+    'GraphUNet',
+    'SchNet',
+    'DimeNet',
+    'GNNExplainer',
+    'MetaPath2Vec',
+]
+import scipy.sparse
+from sklearn.decomposition import TruncatedSVD
+from sklearn.metrics import roc_auc_score, f1_score
+import torch
+import torch.nn.functional as F
+from torch_sparse import coalesce
+from torch_geometric.nn import SignedConv
+
+from torch_geometric.utils import (negative_sampling,
+                                   structured_negative_sampling)
+
+
+class SignedGCN(torch.nn.Module):
+    r"""The signed graph convolutional network model from the `"Signed Graph
+    Convolutional Network" <https://arxiv.org/abs/1808.06354>`_ paper.
+    Internally, this module uses the
+    :class:`torch_geometric.nn.conv.SignedConv` operator.
+
+    Args:
+        in_channels (int): Size of each input sample.
+        hidden_channels (int): Size of each hidden sample.
+        num_layers (int): Number of layers.
+        lamb (float, optional): Balances the contributions of the overall
+            objective. (default: :obj:`5`)
+        bias (bool, optional): If set to :obj:`False`, all layers will not
+            learn an additive bias. (default: :obj:`True`)
+    """
+
+    def __init__(self, in_channels, hidden_channels, num_layers, lamb=5,
+                 bias=True):
+        super(SignedGCN, self).__init__()
+
+        self.in_channels = in_channels
+        self.hidden_channels = hidden_channels
+        self.num_layers = num_layers
+        self.lamb = lamb
+
+        self.conv1 = SignedConv(in_channels, hidden_channels // 2,
+                                first_aggr=True)
+        self.convs = torch.nn.ModuleList()
+        for i in range(num_layers - 1):
+            self.convs.append(
+                SignedConv(hidden_channels // 2, hidden_channels // 2,
+                           first_aggr=False))
+
+        self.lin = torch.nn.Linear(2 * hidden_channels, 3)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.conv1.reset_parameters()
+        for conv in self.convs:
+            conv.reset_parameters()
+        self.lin.reset_parameters()
+
+    def split_edges(self, edge_index, test_ratio=0.2):
+        r"""Splits the edges :obj:`edge_index` into train and test edges.
+
+        Args:
+            edge_index (LongTensor): The edge indices.
+            test_ratio (float, optional): The ratio of test edges.
+                (default: :obj:`0.2`)
+        """
+        mask = torch.ones(edge_index.size(1), dtype=torch.bool)
+        mask[torch.randperm(mask.size(0))[:int(test_ratio * mask.size(0))]] = 0
+
+        train_edge_index = edge_index[:, mask]
+        test_edge_index = edge_index[:, ~mask]
+
+        return train_edge_index, test_edge_index
+
+    def create_spectral_features(self, pos_edge_index, neg_edge_index,
+                                 num_nodes=None):
+        r"""Creates :obj:`in_channels` spectral node features based on
+        positive and negative edges.
+
+        Args:
+            pos_edge_index (LongTensor): The positive edge indices.
+            neg_edge_index (LongTensor): The negative edge indices.
+            num_nodes (int, optional): The number of nodes, *i.e.*
+                :obj:`max_val + 1` of :attr:`pos_edge_index` and
+                :attr:`neg_edge_index`. (default: :obj:`None`)
+        """
+
+        edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=1)
+        N = edge_index.max().item() + 1 if num_nodes is None else num_nodes
+        edge_index = edge_index.to(torch.device('cpu'))
+
+        pos_val = torch.full((pos_edge_index.size(1), ), 2, dtype=torch.float)
+        neg_val = torch.full((neg_edge_index.size(1), ), 0, dtype=torch.float)
+        val = torch.cat([pos_val, neg_val], dim=0)
+
+        row, col = edge_index
+        edge_index = torch.cat([edge_index, torch.stack([col, row])], dim=1)
+        val = torch.cat([val, val], dim=0)
+
+        edge_index, val = coalesce(edge_index, val, N, N)
+        val = val - 1
+
+        # Borrowed from:
+        # https://github.com/benedekrozemberczki/SGCN/blob/master/src/utils.py
+        edge_index = edge_index.detach().numpy()
+        val = val.detach().numpy()
+        A = scipy.sparse.coo_matrix((val, edge_index), shape=(N, N))
+        svd = TruncatedSVD(n_components=self.in_channels, n_iter=128)
+        svd.fit(A)
+        x = svd.components_.T
+        return torch.from_numpy(x).to(torch.float).to(pos_edge_index.device)
+
+    def forward(self, x, pos_edge_index, neg_edge_index):
+        """Computes node embeddings :obj:`z` based on positive edges
+        :obj:`pos_edge_index` and negative edges :obj:`neg_edge_index`.
+
+        Args:
+            x (Tensor): The input node features.
+            pos_edge_index (LongTensor): The positive edge indices.
+            neg_edge_index (LongTensor): The negative edge indices.
+        """
+        z = F.relu(self.conv1(x, pos_edge_index, neg_edge_index))
+        for conv in self.convs:
+            z = F.relu(conv(z, pos_edge_index, neg_edge_index))
+        return z
+
+    def discriminate(self, z, edge_index):
+        """Given node embeddings :obj:`z`, classifies the link relation
+        between node pairs :obj:`edge_index` to be either positive,
+        negative or non-existent.
+
+        Args:
+            x (Tensor): The input node features.
+            edge_index (LongTensor): The edge indices.
+        """
+        value = torch.cat([z[edge_index[0]], z[edge_index[1]]], dim=1)
+        value = self.lin(value)
+        return torch.log_softmax(value, dim=1)
+
+    def nll_loss(self, z, pos_edge_index, neg_edge_index):
+        """Computes the discriminator loss based on node embeddings :obj:`z`,
+        and positive edges :obj:`pos_edge_index` and negative nedges
+        :obj:`neg_edge_index`.
+
+        Args:
+            z (Tensor): The node embeddings.
+            pos_edge_index (LongTensor): The positive edge indices.
+            neg_edge_index (LongTensor): The negative edge indices.
+        """
+
+        edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=1)
+        none_edge_index = negative_sampling(edge_index, z.size(0))
+
+        nll_loss = 0
+        nll_loss += F.nll_loss(
+            self.discriminate(z, pos_edge_index),
+            pos_edge_index.new_full((pos_edge_index.size(1), ), 0))
+        nll_loss += F.nll_loss(
+            self.discriminate(z, neg_edge_index),
+            neg_edge_index.new_full((neg_edge_index.size(1), ), 1))
+        nll_loss += F.nll_loss(
+            self.discriminate(z, none_edge_index),
+            none_edge_index.new_full((none_edge_index.size(1), ), 2))
+        return nll_loss / 3.0
+
+    def pos_embedding_loss(self, z, pos_edge_index):
+        """Computes the triplet loss between positive node pairs and sampled
+        non-node pairs.
+
+        Args:
+            z (Tensor): The node embeddings.
+            pos_edge_index (LongTensor): The positive edge indices.
+        """
+        i, j, k = structured_negative_sampling(pos_edge_index, z.size(0))
+
+        out = (z[i] - z[j]).pow(2).sum(dim=1) - (z[i] - z[k]).pow(2).sum(dim=1)
+        return torch.clamp(out, min=0).mean()
+
+    def neg_embedding_loss(self, z, neg_edge_index):
+        """Computes the triplet loss between negative node pairs and sampled
+        non-node pairs.
+
+        Args:
+            z (Tensor): The node embeddings.
+            neg_edge_index (LongTensor): The negative edge indices.
+        """
+        i, j, k = structured_negative_sampling(neg_edge_index, z.size(0))
+
+        out = (z[i] - z[k]).pow(2).sum(dim=1) - (z[i] - z[j]).pow(2).sum(dim=1)
+        return torch.clamp(out, min=0).mean()
+
+    def loss(self, z, pos_edge_index, neg_edge_index):
+        """Computes the overall objective.
+
+        Args:
+            z (Tensor): The node embeddings.
+            pos_edge_index (LongTensor): The positive edge indices.
+            neg_edge_index (LongTensor): The negative edge indices.
+        """
+        nll_loss = self.nll_loss(z, pos_edge_index, neg_edge_index)
+        loss_1 = self.pos_embedding_loss(z, pos_edge_index)
+        loss_2 = self.neg_embedding_loss(z, neg_edge_index)
+        return nll_loss + self.lamb * (loss_1 + loss_2)
+
+    def test(self, z, pos_edge_index, neg_edge_index):
+        """Evaluates node embeddings :obj:`z` on positive and negative test
+        edges by computing AUC and F1 scores.
+
+        Args:
+            z (Tensor): The node embeddings.
+            pos_edge_index (LongTensor): The positive edge indices.
+            neg_edge_index (LongTensor): The negative edge indices.
+        """
+        with torch.no_grad():
+            pos_p = self.discriminate(z, pos_edge_index)[:, :2].max(dim=1)[1]
+            neg_p = self.discriminate(z, neg_edge_index)[:, :2].max(dim=1)[1]
+        pred = (1 - torch.cat([pos_p, neg_p])).cpu()
+        y = torch.cat(
+            [pred.new_ones((pos_p.size(0))),
+             pred.new_zeros(neg_p.size(0))])
+        pred, y = pred.numpy(), y.numpy()
+
+        auc = roc_auc_score(y, pred)
+        f1 = f1_score(y, pred, average='binary') if pred.sum() > 0 else 0
+
+        return auc, f1
+
+    def __repr__(self):
+        return '{}({}, {}, num_layers={})'.format(self.__class__.__name__,
+                                                  self.in_channels,
+                                                  self.hidden_channels,
+                                                  self.num_layers)
+import torch
+from torch.nn import Parameter
+from sklearn.linear_model import LogisticRegression
+
+from ..inits import reset, uniform
+
+EPS = 1e-15
+
+
+class DeepGraphInfomax(torch.nn.Module):
+    r"""The Deep Graph Infomax model from the
+    `"Deep Graph Infomax" <https://arxiv.org/abs/1809.10341>`_
+    paper based on user-defined encoder and summary model :math:`\mathcal{E}`
+    and :math:`\mathcal{R}` respectively, and a corruption function
+    :math:`\mathcal{C}`.
+
+    Args:
+        hidden_channels (int): The latent space dimensionality.
+        encoder (Module): The encoder module :math:`\mathcal{E}`.
+        summary (callable): The readout function :math:`\mathcal{R}`.
+        corruption (callable): The corruption function :math:`\mathcal{C}`.
+    """
+
+    def __init__(self, hidden_channels, encoder, summary, corruption):
+        super(DeepGraphInfomax, self).__init__()
+        self.hidden_channels = hidden_channels
+        self.encoder = encoder
+        self.summary = summary
+        self.corruption = corruption
+
+        self.weight = Parameter(torch.Tensor(hidden_channels, hidden_channels))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        reset(self.encoder)
+        reset(self.summary)
+        uniform(self.hidden_channels, self.weight)
+
+    def forward(self, *args, **kwargs):
+        """Returns the latent space for the input arguments, their
+        corruptions and their summary representation."""
+        pos_z = self.encoder(*args, **kwargs)
+        cor = self.corruption(*args, **kwargs)
+        cor = cor if isinstance(cor, tuple) else (cor, )
+        neg_z = self.encoder(*cor)
+        summary = self.summary(pos_z, *args, **kwargs)
+        return pos_z, neg_z, summary
+
+    def discriminate(self, z, summary, sigmoid=True):
+        r"""Given the patch-summary pair :obj:`z` and :obj:`summary`, computes
+        the probability scores assigned to this patch-summary pair.
+
+        Args:
+            z (Tensor): The latent space.
+            sigmoid (bool, optional): If set to :obj:`False`, does not apply
+                the logistic sigmoid function to the output.
+                (default: :obj:`True`)
+        """
+        value = torch.matmul(z, torch.matmul(self.weight, summary))
+        return torch.sigmoid(value) if sigmoid else value
+
+    def loss(self, pos_z, neg_z, summary):
+        r"""Computes the mutal information maximization objective."""
+        pos_loss = -torch.log(
+            self.discriminate(pos_z, summary, sigmoid=True) + EPS).mean()
+        neg_loss = -torch.log(
+            1 - self.discriminate(neg_z, summary, sigmoid=True) + EPS).mean()
+
+        return pos_loss + neg_loss
+
+    def test(self, train_z, train_y, test_z, test_y, solver='lbfgs',
+             multi_class='auto', *args, **kwargs):
+        r"""Evaluates latent space quality via a logistic regression downstream
+        task."""
+        clf = LogisticRegression(solver=solver, multi_class=multi_class, *args,
+                                 **kwargs).fit(train_z.detach().cpu().numpy(),
+                                               train_y.detach().cpu().numpy())
+        return clf.score(test_z.detach().cpu().numpy(),
+                         test_y.detach().cpu().numpy())
+
+    def __repr__(self):
+        return '{}({})'.format(self.__class__.__name__, self.hidden_channels)
+from math import sqrt, pi as PI
+
+import torch
+from torch.nn import Linear
+from torch_scatter import scatter
+from torch_sparse import SparseTensor
+
+from ..acts import swish
+from ..inits import glorot_orthogonal
+from .dimenet_utils import bessel_basis, real_sph_harm
+
+try:
+    import sympy as sym
+except ImportError:
+    sym = None
+
+
+class Envelope(torch.nn.Module):
+    def __init__(self, exponent):
+        super(Envelope, self).__init__()
+        self.p = exponent
+        self.a = -(self.p + 1) * (self.p + 2) / 2
+        self.b = self.p * (self.p + 2)
+        self.c = -self.p * (self.p + 1) / 2
+
+    def forward(self, x):
+        p, a, b, c = self.p, self.a, self.b, self.c
+        x_pow_p0 = x.pow(p)
+        x_pow_p1 = x_pow_p0 * x
+        return 1. / x + a * x_pow_p0 + b * x_pow_p1 + c * x_pow_p1 * x
+
+
+class BesselBasisLayer(torch.nn.Module):
+    def __init__(self, num_radial, cutoff=5.0, envelope_exponent=5):
+        super(BesselBasisLayer, self).__init__()
+        self.cutoff = cutoff
+        self.envelope = Envelope(envelope_exponent)
+
+        self.freq = torch.nn.Parameter(torch.Tensor(num_radial))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.arange(1, self.freq.numel() + 1, out=self.freq).mul_(PI)
+
+    def forward(self, dist):
+        dist = dist.unsqueeze(-1) / self.cutoff
+        return self.envelope(dist) * (self.freq * dist).sin()
+
+
+class SphericalBasisLayer(torch.nn.Module):
+    def __init__(self, num_spherical, num_radial, cutoff=5.0,
+                 envelope_exponent=5):
+        super(SphericalBasisLayer, self).__init__()
+        assert num_radial <= 64
+        self.num_spherical = num_spherical
+        self.num_radial = num_radial
+        self.cutoff = cutoff
+        self.envelope = Envelope(envelope_exponent)
+
+        bessel_forms = bessel_basis(num_spherical, num_radial)
+        sph_harm_forms = real_sph_harm(num_spherical)
+        self.sph_funcs = []
+        self.bessel_funcs = []
+
+        x, theta = sym.symbols('x theta')
+        modules = {'sin': torch.sin, 'cos': torch.cos}
+        for i in range(num_spherical):
+            if i == 0:
+                sph1 = sym.lambdify([theta], sph_harm_forms[i][0], modules)(0)
+                self.sph_funcs.append(lambda x: torch.zeros_like(x) + sph1)
+            else:
+                sph = sym.lambdify([theta], sph_harm_forms[i][0], modules)
+                self.sph_funcs.append(sph)
+            for j in range(num_radial):
+                bessel = sym.lambdify([x], bessel_forms[i][j], modules)
+                self.bessel_funcs.append(bessel)
+
+    def forward(self, dist, angle, idx_kj):
+        dist = dist / self.cutoff
+        rbf = torch.stack([f(dist) for f in self.bessel_funcs], dim=1)
+        rbf = self.envelope(dist).unsqueeze(-1) * rbf
+
+        cbf = torch.stack([f(angle) for f in self.sph_funcs], dim=1)
+
+        n, k = self.num_spherical, self.num_radial
+        out = (rbf[idx_kj].view(-1, n, k) * cbf.view(-1, n, 1)).view(-1, n * k)
+        return out
+
+
+class EmbeddingBlock(torch.nn.Module):
+    def __init__(self, in_channels, num_radial, hidden_channels, act=swish):
+        super(EmbeddingBlock, self).__init__()
+        self.act = act
+
+        self.lin_x = Linear(in_channels, hidden_channels, bias=False)
+        self.lin_rbf = Linear(num_radial, hidden_channels)
+        self.lin = Linear(3 * hidden_channels, hidden_channels)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.lin_x.weight.data.uniform_(-sqrt(3), sqrt(3))
+        self.lin_rbf.reset_parameters()
+        self.lin.reset_parameters()
+
+    def forward(self, x, rbf, i, j):
+        x = self.lin_x(x)
+        rbf = self.act(self.lin_rbf(rbf))
+        return self.act(self.lin(torch.cat([x[i], x[j], rbf], dim=-1)))
+
+
+class ResidualLayer(torch.nn.Module):
+    def __init__(self, hidden_channels, act=swish):
+        super(ResidualLayer, self).__init__()
+        self.act = act
+        self.lin1 = Linear(hidden_channels, hidden_channels)
+        self.lin2 = Linear(hidden_channels, hidden_channels)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        glorot_orthogonal(self.lin1.weight, scale=2.0)
+        self.lin1.bias.data.fill_(0)
+        glorot_orthogonal(self.lin2.weight, scale=2.0)
+        self.lin2.bias.data.fill_(0)
+
+    def forward(self, x):
+        return x + self.act(self.lin2(self.act(self.lin1(x))))
+
+
+class InteractionBlock(torch.nn.Module):
+    def __init__(self, hidden_channels, num_bilinear, num_spherical,
+                 num_radial, num_before_skip, num_after_skip, act=swish):
+        super(InteractionBlock, self).__init__()
+        self.act = act
+
+        self.lin_rbf = Linear(num_radial, hidden_channels, bias=False)
+        self.lin_sbf = Linear(num_spherical * num_radial, num_bilinear,
+                              bias=False)
+
+        # Dense transformations of input messages.
+        self.lin_kj = Linear(hidden_channels, hidden_channels)
+        self.lin_ji = Linear(hidden_channels, hidden_channels)
+
+        self.W = torch.nn.Parameter(
+            torch.Tensor(hidden_channels, num_bilinear, hidden_channels))
+
+        self.layers_before_skip = torch.nn.ModuleList([
+            ResidualLayer(hidden_channels, act) for _ in range(num_before_skip)
+        ])
+        self.lin = Linear(hidden_channels, hidden_channels)
+        self.layers_after_skip = torch.nn.ModuleList([
+            ResidualLayer(hidden_channels, act) for _ in range(num_after_skip)
+        ])
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        glorot_orthogonal(self.lin_rbf.weight, scale=2.0)
+        glorot_orthogonal(self.lin_sbf.weight, scale=2.0)
+        glorot_orthogonal(self.lin_kj.weight, scale=2.0)
+        self.lin_kj.bias.data.fill_(0)
+        glorot_orthogonal(self.lin_ji.weight, scale=2.0)
+        self.lin_ji.bias.data.fill_(0)
+        self.W.data.normal_(mean=0, std=2 / self.W.size(0))
+        for res_layer in self.layers_before_skip:
+            res_layer.reset_parameters()
+        glorot_orthogonal(self.lin.weight, scale=2.0)
+        self.lin.bias.data.fill_(0)
+        for res_layer in self.layers_after_skip:
+            res_layer.reset_parameters()
+
+    def forward(self, x, rbf, sbf, idx_kj, idx_ji):
+        rbf = self.lin_rbf(rbf)
+        sbf = self.lin_sbf(sbf)
+
+        x_ji = self.act(self.lin_ji(x))
+        x_kj = self.act(self.lin_kj(x))
+        x_kj = x_kj * rbf
+        x_kj = torch.einsum('wj,wl,ijl->wi', sbf, x_kj[idx_kj], self.W)
+        x_kj = scatter(x_kj, idx_ji, dim=0, dim_size=x.size(0))
+
+        h = x_ji + x_kj
+        for layer in self.layers_before_skip:
+            h = layer(h)
+        h = self.act(self.lin(h)) + x
+        for layer in self.layers_before_skip:
+            h = layer(h)
+
+        return h
+
+
+class OutputBlock(torch.nn.Module):
+    def __init__(self, num_radial, hidden_channels, out_channels, num_layers,
+                 act=swish):
+        super(OutputBlock, self).__init__()
+        self.act = act
+
+        self.lin_rbf = Linear(num_radial, hidden_channels, bias=False)
+        self.lins = torch.nn.ModuleList()
+        for _ in range(num_layers):
+            self.lins.append(Linear(hidden_channels, hidden_channels))
+        self.lin = Linear(hidden_channels, out_channels, bias=False)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        glorot_orthogonal(self.lin_rbf.weight, scale=2.0)
+        for lin in self.lins:
+            glorot_orthogonal(lin.weight, scale=2.0)
+            lin.bias.data.fill_(0)
+        self.lin.weight.data.fill_(0)
+
+    def forward(self, x, rbf, i, num_nodes=None):
+        x = self.lin_rbf(rbf) * x
+        x = scatter(x, i, dim=0, dim_size=num_nodes)
+        for lin in self.lins:
+            x = self.act(lin(x))
+        return self.lin(x)
+
+
+class DimeNet(torch.nn.Module):
+    r"""The directional message passing neural network (DimeNet) from the
+    `"Directional Message Passing for Molecular Graphs"
+    <https://arxiv.org/abs/2003.03123>`_ paper.
+    DimeNet transforms messages based on the angle between them in a
+    rotation-equivariant fashion.
+
+    .. note::
+
+        For an example of using DimeNet, see `examples/qm9_dimenet.py
