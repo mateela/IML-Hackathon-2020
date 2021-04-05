@@ -1,0 +1,884 @@
+       frame_faces += arch_frame_faces
+
+    bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+
+    # add depths
+    if prop.add_arch:
+        door_faces, window_faces, [arch_face], frame_faces = add_frame_depth(bm, door_faces, window_faces, [arch_face], frame_faces, prop.frame_depth, normal)
+        arch_face, new_frame_faces = add_arch_depth(bm, arch_face, prop.arch.depth, normal)
+        frame_faces += new_frame_faces
+    else:
+        door_faces, window_faces, _, frame_faces = add_frame_depth(bm, door_faces, window_faces, [], frame_faces, prop.frame_depth, normal)
+
+    door_faces, new_frame_faces = add_multi_door_depth(bm, door_faces, prop.dw_depth, normal)
+    frame_faces += new_frame_faces
+    window_faces, new_frame_faces = add_multi_window_depth(bm, window_faces, prop.dw_depth, normal)
+    frame_faces += new_frame_faces
+
+    # add face maps
+    add_faces_to_map(bm, door_faces, FaceMap.DOOR)
+    add_faces_to_map(bm, window_faces, FaceMap.WINDOW)
+    add_faces_to_map(bm, frame_faces, FaceMap.FRAME)
+    if prop.add_arch:
+        add_faces_to_map(bm, [arch_face], FaceMap.DOOR)
+
+    return door_faces, window_faces, arch_face
+
+
+def add_multi_door_depth(bm, door_faces, depth, normal):
+    new_door_faces = []
+    new_frame_faces = []
+    for door in door_faces:
+        df, ff = add_door_depth(bm, door, depth, normal)
+        new_door_faces.append(df)
+        new_frame_faces += ff
+    return new_door_faces, new_frame_faces
+
+
+def add_multi_window_depth(bm, window_faces, depth, normal):
+    new_window_faces = []
+    new_frame_faces = []
+    for window in window_faces:
+        wf, ff = add_door_depth(bm, window, depth, normal)
+        new_window_faces.append(wf)
+        new_frame_faces += ff
+    return new_window_faces, new_frame_faces
+
+
+def make_multigroup_insets(bm, face, size, frame_thickness, dws):
+    dw_count = count(dws)
+    dw_width = (size.x - frame_thickness * (dw_count + 1)) / dw_count
+    door_height = calc_face_dimensions(face)[1] - frame_thickness
+    window_height = size.y - 2 * frame_thickness
+
+    # adjacent doors/windows clubbed
+    clubbed_widths = [clubbed_width(dw_width, frame_thickness, dw['type'], dw['count'], i == 0, i == len(dws)-1) for i, dw in enumerate(dws)]
+    clubbed_faces = subdivide_face_horizontally(bm, face, clubbed_widths)
+
+    doors = []
+    windows = []
+    frames = []
+
+    for i, (dw, f) in enumerate(zip(dws, clubbed_faces)):
+        if dw['type'] == 'door':
+            ds, fs = make_door_insets(bm, f, dw['count'], door_height, dw_width, frame_thickness, i == 0, i == len(dws)-1)
+            doors.extend(ds)
+            frames.extend(fs)
+        elif dw['type'] == 'window':
+            ws, fs = make_window_insets(bm, f, dw['count'], window_height, dw_width, frame_thickness, i == 0, i == len(dws)-1)
+            windows.extend(ws)
+            frames.extend(fs)
+    return doors, windows, frames
+
+
+def clubbed_width(width, frame_thickness, type, count, first=False, last=False):
+    if type == "door":
+        return (width * count) + (frame_thickness * (count+1))
+    elif type == "window":
+        if first and last:
+            return (width * count) + (frame_thickness * (count+1))
+        elif first or last:
+            return (width * count) + (frame_thickness * count)
+        else:
+            return (width * count) + (frame_thickness * (count-1))
+
+
+def make_window_insets(bm, face, count, window_height, window_width, frame_thickness, first=False, last=False):
+    # split vertically for window
+    face_height = calc_face_dimensions(face)[1]
+    res = subdivide_face_vertically(bm, face, [face_height - (window_height+2*frame_thickness), window_height+2*frame_thickness])
+    if not res:
+        return [], []
+
+    face = res[1]
+    # vertical frame
+    if first and last:
+        h_widths = [frame_thickness, window_width] * count + [frame_thickness]
+    elif first:
+        h_widths = [frame_thickness, window_width] * count
+    elif last:
+        h_widths = [window_width, frame_thickness] * count
+    else:
+        h_widths = [window_width, frame_thickness] * (count-1) + [window_width]
+    h_faces = subdivide_face_horizontally(bm, face, h_widths)
+    # horizontal frames
+    if first:
+        work_faces = h_faces[1::2]
+        v_frames = h_faces[::2]
+    else:
+        work_faces = h_faces[::2]
+        v_frames = h_faces[1::2]
+    v_widths = [frame_thickness, window_height, frame_thickness]
+    v_faces = [f for h_face in work_faces for f in subdivide_face_vertically(bm, h_face, v_widths)]
+
+    return v_faces[1::3], v_frames + v_faces[::3] + v_faces[2::3]
+
+
+def make_door_insets(bm, face, count, door_height, door_width, frame_thickness, first=False, last=False):
+    # vertical frame
+    h_widths = [frame_thickness, door_width] * count + [frame_thickness]
+    h_faces = subdivide_face_horizontally(bm, face, h_widths)
+    # horizontal frames
+    v_widths = [door_height, frame_thickness]
+    v_faces = [f for h_face in h_faces[1::2] for f in subdivide_face_vertically(bm, h_face, v_widths)]
+    return v_faces[::2], h_faces[::2] + v_faces[1::2]
+
+
+def count(dws):
+    return sum(dw["count"] for dw in dws)
+
+
+def parse_components(components):
+    char_to_type = {
+        "d": "door",
+        "w": "window",
+    }
+    previous = None
+    dws = []
+    for c in components:
+        if c == previous:
+            dws[-1]["count"] += 1
+        else:
+            dws.append({"type": char_to_type.get(c), "count": 1})
+            previous = c
+    return dws
+import bpy
+from bpy.props import FloatProperty, EnumProperty, PointerProperty, BoolProperty, StringProperty
+
+from ..fill import FillPanel, FillLouver, FillGlassPanes
+from ..generic import ArchProperty, SizeOffsetProperty, CountProperty
+
+
+class MultigroupProperty(bpy.types.PropertyGroup):
+    frame_thickness: FloatProperty(
+        name="Frame Thickness",
+        min=0.01,
+        max=1.0,
+        default=0.1,
+        description="Thickness of door/window Frame",
+    )
+
+    frame_depth: FloatProperty(
+        name="Frame Depth",
+        min=-1.0,
+        max=1.0,
+        default=0.0,
+        step=1,
+        description="Depth of door/window Frame",
+    )
+
+    dw_depth: FloatProperty(
+        name="Door/Window Depth",
+        min=0.0,
+        max=1.0,
+        default=0.05,
+        description="Depth of door/window",
+    )
+
+    add_arch: BoolProperty(
+        name="Add Arch",
+        default=False,
+        description="Add arch over door/window",
+    )
+
+    components: StringProperty(
+        name="Components",
+        default="dw",
+        description="Components (Door and Windows): example: 'wdw' for a door surrounded by windows",
+    )
+
+    fill_items = [
+        ("NONE", "None", "", 0),
+        ("PANELS", "Panels", "", 1),
+        ("GLASS_PANES", "Glass_Panes", "", 2),
+        ("LOUVER", "Louver", "", 3),
+    ]
+
+    fill_type: EnumProperty(
+        name="Fill Type",
+        items=fill_items,
+        default="NONE",
+        description="Type of fill for door/window",
+    )
+
+    count: CountProperty
+    arch: PointerProperty(type=ArchProperty)
+    size_offset: PointerProperty(type=SizeOffsetProperty)
+
+    double_door: BoolProperty(
+        name="Double Door",
+        default=False,
+        description="Double door",
+    )
+
+    panel_fill: PointerProperty(type=FillPanel)
+    glass_fill: PointerProperty(type=FillGlassPanes)
+    louver_fill: PointerProperty(type=FillLouver)
+
+    def init(self, wall_dimensions):
+        self['wall_dimensions'] = wall_dimensions
+        self.size_offset.init((self['wall_dimensions'][0]/self.count, self['wall_dimensions'][1]), default_size=(2.0, 1.0), default_offset=(0.0, 0.0))
+        self.arch.init(wall_dimensions[1]/2 - self.size_offset.offset.y - self.size_offset.size.y/2)
+
+    def draw(self, context, layout):
+        box = layout.box()
+        self.size_offset.draw(context, box)
+
+        box = layout.box()
+        col = box.column(align=True)
+        col.label(text="Components")
+        col.prop(self, "components", text="")
+        col = box.column(align=True)
+        row = col.row(align=True)
+        row.prop(self, "dw_depth")
+        row = col.row(align=True)
+        row.prop(self, "frame_depth")
+        row.prop(self, "frame_thickness")
+
+        col = box.column(align=True)
+        col.prop(self, "count")
+
+        col = box.column(align=True)
+        col.prop(self, "double_door")
+
+        box = layout.box()
+        col = box.column(align=True)
+        col.prop(self, "add_arch")
+        if self.add_arch:
+            self.arch.draw(context, box)
+
+        box = layout.box()
+        col = box.column(align=True)
+        col.prop_menu_enum(self, "fill_type")
+
+        # -- draw fill types
+        fill_map = {
+            "PANELS": self.panel_fill,
+            "LOUVER": self.louver_fill,
+            "GLASS_PANES": self.glass_fill,
+        }
+        fill = fill_map.get(self.fill_type)
+        if fill:
+            fill.draw(box)
+import bpy
+from .multigroup import Multigroup
+from .multigroup_props import MultigroupProperty
+from ...utils import get_selected_face_dimensions
+
+
+class BTOOLS_OT_add_multigroup(bpy.types.Operator):
+    """Create multiple door/window group from selected faces"""
+
+    bl_idname = "btools.add_multigroup"
+    bl_label = "Add Multigroup"
+    bl_options = {"REGISTER", "UNDO"}
+
+    props: bpy.props.PointerProperty(type=MultigroupProperty)
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.mode == "EDIT_MESH"
+
+    def execute(self, context):
+        self.props.init(get_selected_face_dimensions(context))
+        return Multigroup.build(context, self.props)
+
+    def draw(self, context):
+        self.props.draw(context, self.layout)
+import bpy
+
+from .multigroup_ops import BTOOLS_OT_add_multigroup
+from .multigroup_props import MultigroupProperty
+
+classes = (MultigroupProperty, BTOOLS_OT_add_multigroup)
+
+
+def register_multigroup():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+
+def unregister_multigroup():
+    for cls in classes:
+        bpy.utils.unregister_class(cls)
+import bmesh
+
+from .multigroup_types import create_multigroup
+from ...utils import get_edit_mesh, FaceMap, add_facemap_for_groups, verify_facemaps_for_object
+
+
+class Multigroup:
+    @classmethod
+    def build(cls, context, props):
+        verify_facemaps_for_object(context.object)
+        me = get_edit_mesh()
+        bm = bmesh.from_edit_mesh(me)
+        faces = [face for face in bm.faces if face.select]
+
+        if cls.validate(faces):
+            cls.add_multigroup_facemaps()
+            if create_multigroup(bm, faces, props):
+                bmesh.update_edit_mesh(me, True)
+                return {"FINISHED"}
+        return {"CANCELLED"}
+
+    @classmethod
+    def add_multigroup_facemaps(cls):
+        groups = FaceMap.DOOR, FaceMap.WINDOW, FaceMap.FRAME
+        add_facemap_for_groups(groups)
+
+    @classmethod
+    def validate(cls, faces):
+        if faces:
+            if not any([round(f.normal.z, 1) for f in faces]):
+                return True
+        return False
+import bmesh
+
+from .balcony_types import create_balcony
+from ...utils import get_edit_mesh, FaceMap, add_facemap_for_groups, verify_facemaps_for_object
+
+
+class Balcony:
+    @classmethod
+    def build(cls, context, prop):
+        verify_facemaps_for_object(context.object)
+        me = get_edit_mesh()
+        bm = bmesh.from_edit_mesh(me)
+        faces = [face for face in bm.faces if face.select]
+
+        if cls.validate(faces):
+            cls.add_balcony_facemaps()
+            create_balcony(bm, faces, prop)
+            bmesh.update_edit_mesh(me, True)
+            return {"FINISHED"}
+        return {"CANCELLED"}
+
+    @classmethod
+    def add_balcony_facemaps(cls):
+        groups = FaceMap.BALCONY
+        add_facemap_for_groups(groups)
+
+    @classmethod
+    def validate(cls, faces):
+        if faces:
+            # -- ensure none are upward facing
+            if not any([round(f.normal.z, 1) for f in faces]):
+                return True
+        return False
+import bpy
+
+from .balcony_ops import BTOOLS_OT_add_balcony
+from .balcony_props import BalconyProperty
+
+classes = (BalconyProperty, BTOOLS_OT_add_balcony)
+
+
+def register_balcony():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+
+def unregister_balcony():
+    for cls in classes:
+        bpy.utils.unregister_class(cls)
+import bpy
+from bpy.props import BoolProperty, FloatProperty, PointerProperty
+
+from ..railing.railing_props import RailProperty
+from ..generic import SizeOffsetProperty
+
+
+class BalconyProperty(bpy.types.PropertyGroup):
+    redo: BoolProperty()
+
+    slab_height: FloatProperty(
+        name="Slab Height",
+        min=0.01,
+        max=100.0,
+        default=0.2,
+        description="Height of balcony slab",
+    )
+
+    depth_offset: FloatProperty(
+        name="Depth Offset",
+        min=0.0,
+        max=100.0,
+        default=0.0,
+        description="Depth offset of balcony",
+    )
+
+    has_railing: BoolProperty(
+        name="Add Railing", default=True, description="Whether the balcony has railing"
+    )
+
+    rail: PointerProperty(type=RailProperty)
+
+    size_offset: PointerProperty(type=SizeOffsetProperty)
+
+    def init(self, wall_dimensions):
+        self['wall_dimensions'] = wall_dimensions
+        self.size_offset.init((self['wall_dimensions'][0], self['wall_dimensions'][1]), default_size=(1.6, 1.0), default_offset=(0.0, 0.0), restricted=False)
+
+    def draw(self, context, layout):
+        self.size_offset.draw(context, layout)
+
+        col = layout.column(align=True)
+        col.prop(self, "depth_offset")
+
+        col = layout.column(align=True)
+        col.prop(self, "slab_height")
+
+        layout.prop(self, "has_railing")
+        if self.has_railing:
+            box = layout.box()
+            self.rail.draw(context, box)
+import bpy
+from .balcony import Balcony
+from .balcony_props import BalconyProperty
+from ...utils import get_selected_face_dimensions
+
+
+class BTOOLS_OT_add_balcony(bpy.types.Operator):
+    """Create a balcony from selected faces"""
+
+    bl_idname = "btools.add_balcony"
+    bl_label = "Add Balcony"
+    bl_options = {"REGISTER", "UNDO"}
+
+    props: bpy.props.PointerProperty(type=BalconyProperty)
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.mode == "EDIT_MESH"
+
+    def execute(self, context):
+        self.props.init(get_selected_face_dimensions(context))
+        return Balcony.build(context, self.props)
+
+    def draw(self, context):
+        self.props.draw(context, self.layout)
+import bmesh
+from bmesh.types import BMVert, BMFace
+from mathutils import Vector
+
+from ...utils import (
+    FaceMap,
+    filter_geom,
+    add_faces_to_map,
+    get_top_faces,
+    sort_edges,
+    local_xyz,
+    create_face,
+    valid_ngon,
+    popup_message,
+)
+
+from ..railing.railing import create_railing
+
+
+def create_balcony(bm, faces, prop):
+    """Generate balcony geometry
+    """
+    for f in faces:
+        if not valid_ngon(f):
+            popup_message("Balcony creation not supported for non-rectangular n-gon!", "Ngon Error")
+            return False
+
+        f.select = False
+
+        normal = f.normal.copy()
+        f = create_balcony_split(bm, f, prop)
+        add_faces_to_map(bm, [f], FaceMap.BALCONY)
+
+        front, top = extrude_balcony(bm, f, prop.size_offset.size.y, normal)
+
+        if prop.has_railing:
+            add_railing_to_balcony(bm, top, normal, prop)
+        bmesh.ops.delete(bm, geom=[f], context="FACES_ONLY")
+
+
+def extrude_balcony(bm, face, depth, normal):
+    front = filter_geom(bmesh.ops.extrude_face_region(bm, geom=[face])["geom"], BMFace)[0]
+    map_balcony_faces(bm, front)
+    bmesh.ops.translate(
+        bm, verts=front.verts, vec=normal * depth
+    )
+
+    top = get_top_faces(f for e in front.edges for f in e.link_faces)[0]
+    return front, top
+
+
+def add_railing_to_balcony(bm, top, balcony_normal, prop):
+    """Add railing to the balcony
+    """
+    ret = bmesh.ops.duplicate(bm, geom=[top])
+    dup_top = filter_geom(ret["geom"], BMFace)[0]
+
+    ret = bmesh.ops.inset_individual(
+        bm, faces=[dup_top], thickness=prop.rail.offset, use_even_offset=True
+    )
+    bmesh.ops.delete(bm, geom=ret["faces"], context="FACES")
+
+    edges = sort_edges(dup_top.edges, balcony_normal)[1:]
+    railing_geom = bmesh.ops.extrude_edge_only(bm, edges=edges)["geom"]
+    bmesh.ops.translate(
+        bm, verts=filter_geom(railing_geom, BMVert), vec=(0., 0., prop.rail.corner_post_height)
+    )
+
+    bmesh.ops.delete(bm, geom=[dup_top], context="FACES")
+
+    railing_faces = filter_geom(railing_geom, BMFace)
+    create_railing(bm, railing_faces, prop.rail, balcony_normal)
+
+
+def map_balcony_faces(bm, face):
+    """ Add balcony faces to their facemap """
+    new_faces = {
+        f
+        for e in face.edges
+        for f in e.link_faces
+    }
+    add_faces_to_map(bm, new_faces, FaceMap.BALCONY)
+
+
+def create_balcony_split(bm, face, prop):
+    """Use properties to create face
+    """
+    xyz = local_xyz(face)
+    size = Vector((prop.size_offset.size.x, prop.slab_height))
+    f = create_face(bm, size, prop.size_offset.offset, xyz)
+    bmesh.ops.translate(
+        bm, verts=f.verts, vec=face.calc_center_bounds() - face.normal*prop.depth_offset
+    )
+    return f
+import bmesh
+
+from .door_types import create_door
+from ...utils import get_edit_mesh, FaceMap, add_facemap_for_groups, verify_facemaps_for_object
+
+
+class Door:
+    @classmethod
+    def build(cls, context, props):
+        verify_facemaps_for_object(context.object)
+        me = get_edit_mesh()
+        bm = bmesh.from_edit_mesh(me)
+        faces = [face for face in bm.faces if face.select]
+
+        if cls.validate(faces):
+            cls.add_door_facemaps()
+            if create_door(bm, faces, props):
+                bmesh.update_edit_mesh(me, True)
+                return {"FINISHED"}
+        return {"CANCELLED"}
+
+    @classmethod
+    def add_door_facemaps(cls):
+        groups = FaceMap.DOOR, FaceMap.FRAME
+        add_facemap_for_groups(groups)
+
+    @classmethod
+    def validate(cls, faces):
+        if faces:
+            if not any([round(f.normal.z, 1) for f in faces]):
+                return True
+        return False
+import bpy
+from bpy.props import FloatProperty, EnumProperty, PointerProperty, BoolProperty
+
+from ..fill import FillPanel, FillLouver, FillGlassPanes
+from ..generic import ArchProperty, SizeOffsetProperty, CountProperty
+
+
+class DoorProperty(bpy.types.PropertyGroup):
+    frame_thickness: FloatProperty(
+        name="Frame Thickness",
+        min=0.01,
+        max=1.0,
+        default=0.1,
+        description="Thickness of door Frame",
+    )
+
+    frame_depth: FloatProperty(
+        name="Frame Depth",
+        min=-1.0,
+        max=1.0,
+        default=0.0,
+        step=1,
+        description="Depth of door Frame",
+    )
+
+    door_depth: FloatProperty(
+        name="Door Depth",
+        min=0.0,
+        max=1.0,
+        default=0.05,
+        description="Depth of door",
+    )
+
+    add_arch: BoolProperty(
+        name="Add Arch",
+        default=False,
+        description="Add arch over door/window",
+    )
+
+    fill_items = [
+        ("NONE", "None", "", 0),
+        ("PANELS", "Panels", "", 1),
+        ("GLASS_PANES", "Glass_Panes", "", 2),
+        ("LOUVER", "Louver", "", 3),
+    ]
+
+    fill_type: EnumProperty(
+        name="Fill Type",
+        items=fill_items,
+        default="NONE",
+        description="Type of fill for door",
+    )
+
+    count: CountProperty
+    arch: PointerProperty(type=ArchProperty)
+    size_offset: PointerProperty(type=SizeOffsetProperty)
+
+    double_door: BoolProperty(
+        name="Double Door",
+        default=False,
+        description="Double door",
+    )
+
+    panel_fill: PointerProperty(type=FillPanel)
+    glass_fill: PointerProperty(type=FillGlassPanes)
+    louver_fill: PointerProperty(type=FillLouver)
+
+    def init(self, wall_dimensions):
+        self['wall_dimensions'] = wall_dimensions
+        self.size_offset.init((self['wall_dimensions'][0]/self.count, self['wall_dimensions'][1]), default_size=(1.0, 1.0), default_offset=(0.0, 0.0))
+        self.arch.init(wall_dimensions[1]/2 - self.size_offset.offset.y - self.size_offset.size.y/2)
+
+    def draw(self, context, layout):
+        box = layout.box()
+        self.size_offset.draw(context, box)
+
+        box = layout.box()
+        col = box.column(align=True)
+        row = col.row(align=True)
+        row.prop(self, "frame_depth")
+        row.prop(self, "frame_thickness")
+        row = col.row(align=True)
+        row.prop(self, "door_depth")
+
+        col = box.column(align=True)
+        col.prop(self, "count")
+
+        col = box.column(align=True)
+        col.prop(self, "double_door")
+
+        box = layout.box()
+        col = box.column(align=True)
+        col.prop(self, "add_arch")
+        if self.add_arch:
+            self.arch.draw(context, box)
+
+        box = layout.box()
+        col = box.column(align=True)
+        prop_name = "Fill Type" if self.fill_type == "NONE" else self.fill_type.title().replace('_', ' ')
+        col.prop_menu_enum(self, "fill_type", text=prop_name)
+
+        # -- draw fill types
+        fill_map = {
+            "PANELS": self.panel_fill,
+            "LOUVER": self.louver_fill,
+            "GLASS_PANES": self.glass_fill,
+        }
+        fill = fill_map.get(self.fill_type)
+        if fill:
+            fill.draw(box)
+import bpy
+from .door import Door
+from .door_props import DoorProperty
+from ...utils import get_selected_face_dimensions
+
+
+class BTOOLS_OT_add_door(bpy.types.Operator):
+    """Create a door from selected faces"""
+
+    bl_idname = "btools.add_door"
+    bl_label = "Add Door"
+    bl_options = {"REGISTER", "UNDO"}
+
+    props: bpy.props.PointerProperty(type=DoorProperty)
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.mode == "EDIT_MESH"
+
+    def execute(self, context):
+        self.props.init(get_selected_face_dimensions(context))
+        return Door.build(context, self.props)
+
+    def draw(self, context):
+        self.props.draw(context, self.layout)
+import bpy
+
+from .door_ops import BTOOLS_OT_add_door
+from .door_props import DoorProperty
+
+classes = (DoorProperty, BTOOLS_OT_add_door)
+
+
+def register_door():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+
+def unregister_door():
+    for cls in classes:
+        bpy.utils.unregister_class(cls)
+import bmesh
+from ..generic import clamp_count
+from ..frame import add_frame_depth
+from ..fill import fill_panel, fill_glass_panes, fill_louver, FillUser
+
+from ..arch import (
+    fill_arch,
+    create_arch,
+    add_arch_depth,
+)
+from ...utils import (
+    FaceMap,
+    local_xyz,
+    valid_ngon,
+    popup_message,
+    map_new_faces,
+    get_top_edges,
+    get_top_faces,
+    get_bottom_faces,
+    add_faces_to_map,
+    extrude_face_region,
+    calc_face_dimensions,
+    add_facemap_for_groups,
+    subdivide_face_vertically,
+    subdivide_face_horizontally,
+)
+
+
+def create_door(bm, faces, prop):
+    """Create door from face selection
+    """
+    for face in faces:
+        if not valid_ngon(face):
+            popup_message("Door creation not supported non-rectangular n-gon!", "Ngon Error")
+            return False
+
+        face.select = False
+        clamp_count(calc_face_dimensions(face)[0], prop.frame_thickness * 2, prop)
+        array_faces = subdivide_face_horizontally(bm, face, widths=[prop.size_offset.size.x]*prop.count)
+        for aface in array_faces:
+            face = create_door_split(bm, aface, prop.size_offset.size, prop.size_offset.offset)
+            door, arch = create_door_frame(bm, face, prop)
+            create_door_fill(bm, door, prop)
+            if prop.add_arch:
+                fill_arch(bm, arch, prop)
+    return True
+
+
+@map_new_faces(FaceMap.WALLS)
+def create_door_split(bm, face, size, offset):
+    """Use properties from SizeOffset to subdivide face into regular quads
+    """
+
+    wall_w, wall_h = calc_face_dimensions(face)
+    # horizontal split
+    h_widths = [wall_w/2 + offset.x - size.x/2, size.x, wall_w/2 - offset.x - size.x/2]
+    h_faces = subdivide_face_horizontally(bm, face, h_widths)
+    # vertical split
+    v_width = [wall_h/2 + offset.y + size.y/2, wall_h/2 - offset.y - size.y/2]
+    v_faces = subdivide_face_vertically(bm, h_faces[1], v_width)
+
+    return v_faces[0]
+
+
+def create_door_frame(bm, face, prop):
+    """Extrude and inset face to make door frame
+    """
+    normal = face.normal.copy()
+
+    door_face, frame_faces = make_door_inset(bm, face, prop.size_offset.size, prop.frame_thickness)
+    arch_face = None
+
+    # create arch
+    if prop.add_arch:
+        frame_faces.remove(get_top_faces(frame_faces).pop()) # remove top face from frame_faces
+        top_edges = get_top_edges({e for f in get_bottom_faces(frame_faces, n=2) for e in f.edges}, n=2)
+        arch_face, arch_frame_faces = create_arch(bm, top_edges, frame_faces, prop.arch, prop.frame_thickness, local_xyz(face))
+        frame_faces += arch_frame_faces
+
+    bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+
+    # add depths
+    if prop.add_arch:
+        [door_face], _, [arch_face], frame_faces = add_frame_depth(bm, [door_face], [], [arch_face], frame_faces, prop.frame_depth, normal)
+        arch_face, new_frame_faces = add_arch_depth(bm, arch_face, prop.arch.depth, normal)
+        frame_faces += new_frame_faces
+    else:
+        [door_face], _, _, frame_faces = add_frame_depth(bm, [door_face], [], [], frame_faces, prop.frame_depth, normal)
+
+    door_face, new_frame_faces = add_door_depth(bm, door_face, prop.door_depth, normal)
+    frame_faces += new_frame_faces
+
+    # add face maps
+    add_faces_to_map(bm, [door_face], FaceMap.DOOR)
+    add_faces_to_map(bm, frame_faces, FaceMap.FRAME)
+    if prop.add_arch:
+        add_faces_to_map(bm, [arch_face], FaceMap.DOOR)
+
+    return door_face, arch_face
+
+
+def add_door_depth(bm, door, depth, normal):
+    if depth > 0.0:
+        door_faces, frame_faces = extrude_face_region(bm, [door], -depth, normal)
+        return door_faces[0], frame_faces
+    else:
+        return door, []
+
+
+def create_door_fill(bm, face, prop):
+    """Add decorative elements on door face
+    """
+    if prop.double_door:
+        faces = subdivide_face_horizontally(bm, face, widths=[1, 1])
+        for f in faces:
+            fill_door_face(bm, f, prop)
+    else:
+        fill_door_face(bm, face, prop)
+
+
+def fill_door_face(bm, face, prop):
+    """ Fill individual door face
+    """
+    if prop.fill_type == "PANELS":
+        add_facemap_for_groups(FaceMap.DOOR_PANELS)
+        fill_panel(bm, face, prop.panel_fill)
+    elif prop.fill_type == "GLASS_PANES":
+        add_facemap_for_groups(FaceMap.DOOR_PANES)
+        fill_glass_panes(bm, face, prop.glass_fill, user=FillUser.DOOR)
+    elif prop.fill_type == "LOUVER":
+        add_facemap_for_groups(FaceMap.DOOR_LOUVERS)
+        fill_louver(bm, face, prop.louver_fill, user=FillUser.DOOR)
+
+
+def make_door_inset(bm, face, size, frame_thickness):
+    """ Make one horizontal cut and two vertical cuts on face
+    """
+    door_width = size.x - frame_thickness * 2
+    _, face_height = calc_face_dimensions(face)
+    door_height = face_height - frame_thickness
+    # horizontal cuts
+    h_widths = [frame_thickness, door_width, frame_thickness]
+    h_faces = subdivide_face_horizontally(bm, face, h_widths)
+    # vertical cuts
+    v_widths = [door_height, frame_thickness]
+    v_faces = subdivide_face_vertically(bm, h_faces[1], v_widths)
+    return v_faces[0], h_faces[::2] + [v_faces[1]]
